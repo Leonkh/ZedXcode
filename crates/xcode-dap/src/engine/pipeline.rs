@@ -182,6 +182,20 @@ pub async fn run_pipeline(
     let cfg = &selection::overlaid(cfg, sink);
     let (udid, app_path) = build_phases(cfg, sink, cancel.clone(), true).await?;
 
+    // In DAP mode, supersede any previous session on this simulator BEFORE
+    // installing: on the simulator `simctl install` blocks while that session's
+    // app is still running under lldb (it does not replace or kill it), so a
+    // Rerun would otherwise stall for as long as the old app lives. Signalling
+    // now lets the predecessor tear down (terminating its own app) and unblocks
+    // our install. Best-effort — a failure only risks the install stalling
+    // until the old session is stopped by hand. The plain `xcode-dap run`
+    // (debug == false) does not participate in the DAP pidfile.
+    if debug {
+        if let Err(e) = crate::util::pidfile::kill_old(&udid) {
+            log::warn!(target: "pipeline", "pre-install supersede signal failed: {e:#}");
+        }
+    }
+
     // Phase 5: bundle id + install.
     let bundle_id = bundle_id(&app_path).await?;
     log::info!(target: "pipeline", "bundle id: {bundle_id}");

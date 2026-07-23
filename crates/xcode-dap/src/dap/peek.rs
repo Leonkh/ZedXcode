@@ -174,6 +174,30 @@ pub fn terminated_event() -> Value {
     json!({ "type": "event", "seq": 0, "event": "terminated" })
 }
 
+/// Classify a DAP end-of-session event from lldb-dap:
+/// - `Some(true)`  — `exited`: the debuggee **process** has gone.
+/// - `Some(false)` — `terminated`: the debug **session** ended, but the
+///   process may still be alive (lldb-dap detaches an attach-by-pid session
+///   on disconnect, emitting `terminated` only, leaving the app running).
+/// - `None`        — any other frame.
+///
+/// The proxy needs both: either event means it must own a following
+/// `disconnect` (lldb-dap can wedge on it once its debuggee is gone), but
+/// only `exited` proves the process is gone — the teardown terminate-skip is
+/// gated on that, so a plain `terminated` detach still lets the belt-and-braces
+/// `simctl terminate` honor `terminateOnStop`.
+pub fn terminal_event(raw: &[u8]) -> Option<bool> {
+    let v: Value = serde_json::from_slice(raw).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("event") {
+        return None;
+    }
+    match v.get("event").and_then(Value::as_str) {
+        Some("exited") => Some(true),
+        Some("terminated") => Some(false),
+        _ => None,
+    }
+}
+
 /// Rewrite lldb-dap's attach response into the client's launch response:
 /// `request_seq` -> the client's launch seq and `command` -> `"launch"`
 /// (the command rewrite isn't strictly required, but it is spec-correct).
@@ -336,6 +360,51 @@ mod tests {
             "event output seq=0"
         );
         assert_eq!(summarize("not json"), "unparseable frame (8 bytes)");
+    }
+
+    #[test]
+    fn terminal_event_distinguishes_exited_from_terminated() {
+        // `exited` => process gone (Some(true)); `terminated` => session
+        // ended but process may be alive (Some(false)). The distinction is
+        // load-bearing: lldb-dap detaches an attach session on disconnect,
+        // emitting `terminated` only, and the app must still be terminated.
+        assert_eq!(
+            terminal_event(br#"{"seq":5,"type":"event","event":"exited","body":{"exitCode":0}}"#),
+            Some(true)
+        );
+        assert_eq!(
+            terminal_event(br#"{"seq":6,"type":"event","event":"terminated"}"#),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn terminal_event_rejects_other_frames() {
+        // Other events (a killed *host* process reports `stopped`, not
+        // `terminated`) are not terminal.
+        assert_eq!(
+            terminal_event(
+                br#"{"seq":1,"type":"event","event":"stopped","body":{"reason":"signal"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            terminal_event(br#"{"seq":0,"type":"event","event":"output","body":{}}"#),
+            None
+        );
+        // A *response* named terminate is not an event.
+        assert_eq!(
+            terminal_event(
+                br#"{"seq":2,"type":"response","request_seq":1,"command":"terminate","success":true}"#
+            ),
+            None
+        );
+        // A request that merely mentions the word is not an event either.
+        assert_eq!(
+            terminal_event(br#"{"seq":3,"type":"request","command":"terminate"}"#),
+            None
+        );
+        assert_eq!(terminal_event(b"not json"), None);
     }
 
     #[test]

@@ -20,20 +20,38 @@ pub fn kill_old_and_remember(udid: &str) -> Result<()> {
     claim(&pidfile_path(udid)?, std::process::id())
 }
 
+/// SIGTERM the previous owner (if any) WITHOUT taking ownership — the pidfile
+/// is left untouched, so the predecessor still reads itself as the owner and,
+/// on the resulting teardown, terminates its own (running, debugged) app.
+///
+/// Called after a successful build and before `simctl install`: on the
+/// simulator, `install` blocks while a previous session's app is still running
+/// under lldb (it does not replace/kill it), so a Rerun would otherwise stall
+/// for as long as the old app lives. Signalling early lets the predecessor
+/// tear down and free the bundle so our install can proceed. Ownership is
+/// still taken later, post-launch, via [`kill_old_and_remember`].
+pub fn kill_old(udid: &str) -> Result<()> {
+    signal_old(&pidfile_path(udid)?, std::process::id());
+    Ok(())
+}
+
 /// Remove our pidfile on clean teardown (only if it is still ours —
 /// a newer instance may have re-claimed it).
 pub fn remove(udid: &str) -> Result<()> {
     remove_at(&pidfile_path(udid)?, std::process::id())
 }
 
-fn claim(path: &Path, my_pid: u32) -> Result<()> {
+/// SIGTERM the pidfile's current owner if it is a *different* live xcode-dap
+/// proxy. A missing, stale, foreign, or self pid is a no-op.
+///
+/// Never signal init or ourselves; stale garbage is just overwritten by the
+/// caller. Only signal a pid that still belongs to an xcode-dap proxy: after a
+/// crash/SIGKILL/reboot the pidfile outlives its writer, and macOS reassigns
+/// pids densely (and wraps at ~99999), so a bare pid can now own an unrelated
+/// same-user process (Terminal, an editor, …). Killing that would be the bug —
+/// treat any non-proxy owner as stale garbage.
+fn signal_old(path: &Path, my_pid: u32) {
     if let Some(old) = read_pid(path) {
-        // Never signal init or ourselves; stale garbage is just overwritten.
-        // Only signal a pid that still belongs to an xcode-dap proxy: after a
-        // crash/SIGKILL/reboot the pidfile outlives its writer, and macOS
-        // reassigns pids densely (and wraps at ~99999), so a bare pid can now
-        // own an unrelated same-user process (Terminal, an editor, …). Killing
-        // that would be the bug — treat any non-proxy owner as stale garbage.
         if old > 1 && old != my_pid as i32 && pid_is_xcode_dap(old) {
             log::info!(target: "pidfile", "SIGTERM previous instance (pid {old})");
             // SAFETY: plain kill(2) with a valid signal; failure (e.g. the
@@ -43,6 +61,10 @@ fn claim(path: &Path, my_pid: u32) -> Result<()> {
             }
         }
     }
+}
+
+fn claim(path: &Path, my_pid: u32) -> Result<()> {
+    signal_old(path, my_pid);
     std::fs::write(path, format!("{my_pid}\n"))
         .with_context(|| format!("writing pidfile {}", path.display()))
 }
@@ -166,6 +188,21 @@ mod tests {
         // so no SIGTERM is sent and the pidfile is simply overwritten.
         claim(&path, 4242).unwrap();
         assert_eq!(read_pid(&path), Some(4242));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn signal_old_never_takes_ownership() {
+        // Unlike `claim`, `signal_old` (used by `kill_old`) must NOT write:
+        // the predecessor keeps owning the pidfile so its own teardown reads
+        // `superseded() == false` and terminates its app, unblocking our
+        // install. The test-runner pid is a live, non-proxy owner, so no
+        // SIGTERM is sent and the file is left exactly as-is.
+        let path = temp_pidfile("signal.pid");
+        let owner = std::process::id() as i32;
+        std::fs::write(&path, format!("{owner}\n")).unwrap();
+        signal_old(&path, 4242);
+        assert_eq!(read_pid(&path), Some(owner));
         let _ = std::fs::remove_file(&path);
     }
 

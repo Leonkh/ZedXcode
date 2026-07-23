@@ -46,6 +46,13 @@ const INIT_GUARD: Duration = Duration::from_secs(2);
 /// How long teardown waits for children / writer flushes.
 const TEARDOWN_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a forwarded (live-debuggee) `disconnect` waits for lldb-dap to
+/// exit on its own before the proxy owns the shutdown itself. Guards the wedge
+/// class where lldb-dap kills its simulator debuggee on disconnect but then
+/// never exits — leaving the routing loop hung until Zed force-kills the
+/// adapter. A healthy disconnect completes well under this.
+const DISCONNECT_WEDGE_GRACE: Duration = Duration::from_secs(3);
+
 /// How long teardown waits for a cancelled pipeline to wind down. Must
 /// cover xcodebuild's SIGTERM -> 3 s -> SIGKILL escalation (xcodebuild.rs);
 /// exiting earlier would orphan the build (kill_on_drop dies with us).
@@ -150,6 +157,10 @@ pub struct Proxy {
     /// Disconnect seq received while the pipeline ran; answered ourselves
     /// once the cancelled pipeline winds down.
     pending_disconnect: Option<i64>,
+    /// A live-debuggee `disconnect` we forwarded to lldb-dap: `(seq, deadline)`.
+    /// If lldb-dap has not exited by the deadline (the wedge), the proxy answers
+    /// the disconnect itself and shuts down instead of hanging.
+    disconnect_wait: Option<(i64, tokio::time::Instant)>,
     /// Launched app once the pipeline succeeded (teardown cleanup).
     session: Option<PipelineDone>,
     /// out.log / err.log tailers, started on successful attach.
@@ -164,6 +175,20 @@ pub struct Proxy {
     /// never-attached app is still suspended (`--wait-for-debugger`) and must
     /// be terminated on teardown regardless.
     attached: bool,
+    /// Set once lldb-dap ended the debug session — an `exited` OR a
+    /// `terminated` event. Gates who owns a following client `disconnect`:
+    /// once the session has ended (which is why Zed disconnects), the proxy
+    /// answers the disconnect itself and drives a clean shutdown rather than
+    /// delegating to lldb-dap, which can wedge on a disconnect after its
+    /// simulator debuggee died (see `on_client_message`).
+    session_ended: bool,
+    /// Set only on an `exited` event — the debuggee **process** is gone
+    /// (not a mere `terminated`/detach; lldb-dap detaches an attach-by-pid
+    /// session on disconnect, leaving the app alive). Gates the teardown
+    /// terminate-skip: skipping `simctl terminate` is right only when nothing
+    /// of ours is left to kill (and a successor may now own the bundle id) —
+    /// a plain detach must still terminate the app per `terminateOnStop`.
+    debuggee_exited: bool,
 }
 
 /// Entry point for DAP proxy mode (no subcommand): speak DAP on stdio,
@@ -268,11 +293,14 @@ pub async fn run_dap_mode(mock_pipeline: bool) -> Result<()> {
         pipeline_running: false,
         pipeline_cancel: None,
         pending_disconnect: None,
+        disconnect_wait: None,
         session: None,
         tailers: None,
         oslog: None,
         pidfile_udid: None,
         attached: false,
+        session_ended: false,
+        debuggee_exited: false,
     };
 
     // --- main routing loop -------------------------------------------------
@@ -286,6 +314,9 @@ pub async fn run_dap_mode(mock_pipeline: bool) -> Result<()> {
     // children, remove the pidfile, and flush queued client frames.
     let mut exit_code = 0;
     loop {
+        // Copy the disconnect deadline out before the select so the timer arm
+        // does not borrow `proxy` (the message arms need `&mut proxy`).
+        let disc_deadline = proxy.disconnect_wait.map(|(_, d)| d);
         tokio::select! {
             msg = client_reader.next_message() => match msg {
                 Ok(Some(raw)) => match proxy.on_client_message(&raw) {
@@ -334,12 +365,32 @@ pub async fn run_dap_mode(mock_pipeline: bool) -> Result<()> {
                     }
                 }
             },
+            // Bounded fallback for a forwarded live-debuggee disconnect: if
+            // lldb-dap wedged (killed the debuggee but never exited), answer Zed
+            // ourselves and shut down instead of hanging forever.
+            () = wait_opt_deadline(disc_deadline) => {
+                if let Some((seq, _)) = proxy.disconnect_wait.take() {
+                    log::info!(
+                        "disconnect (seq {seq}): lldb-dap did not exit within {}s — \
+                         owning the shutdown",
+                        DISCONNECT_WEDGE_GRACE.as_secs()
+                    );
+                    proxy.send_to_client(Out::Msg(peek::success_response(seq, "disconnect")));
+                    break;
+                }
+            }
             _ = sigterm.recv() => {
                 log::info!("SIGTERM received");
+                // A newer run claimed our simulator (or an external stop): tell
+                // Zed the session is ending so the adapter's exit reads as a
+                // clean stop, not a crash. Teardown then terminates our
+                // still-owned app, unblocking the successor's install.
+                proxy.announce_superseded();
                 break;
             }
             _ = sigint.recv() => {
                 log::info!("SIGINT received");
+                proxy.announce_superseded();
                 break;
             }
         }
@@ -355,6 +406,30 @@ pub async fn run_dap_mode(mock_pipeline: bool) -> Result<()> {
     // (SIGTERM / lldb-dap-exit paths). Teardown already killed the children
     // and flushed the client writer, so nothing relies on destructors here.
     std::process::exit(exit_code);
+}
+
+/// Sleep until `deadline` if set, else pend forever — the disabled state of the
+/// routing loop's disconnect-wedge timer arm.
+async fn wait_opt_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Whether teardown should run the belt-and-braces `simctl terminate`.
+/// Skip it when a successor superseded us (would kill its app) or when our
+/// debuggee already exited (nothing of ours is left, and the bundle id may
+/// now be the successor's). Otherwise terminate for a `terminateOnStop` app,
+/// or for one that never attached (still suspended under `--wait-for-debugger`
+/// and must not be left frozen).
+fn should_terminate_on_teardown(
+    attached: bool,
+    terminate_on_stop: bool,
+    superseded: bool,
+    debuggee_exited: bool,
+) -> bool {
+    !superseded && !debuggee_exited && (!attached || terminate_on_stop)
 }
 
 impl Proxy {
@@ -379,12 +454,48 @@ impl Proxy {
                         cancel.cancel();
                     }
                     Ok(LoopAction::Continue)
+                } else if self.session_ended {
+                    // lldb-dap already ended the session (an `exited`/
+                    // `terminated` event) — most often because a second ⌘R's
+                    // `simctl install` replaced the running app's bundle,
+                    // killing it, so lldb-dap emitted `terminated` and Zed is
+                    // now disconnecting. We must NOT just forward and wait for
+                    // lldb-dap to exit: against the simulator debugserver it
+                    // can wedge on a disconnect once its debuggee is gone, so
+                    // the routing loop would wait forever for an exit that
+                    // never comes and Zed force-kills the adapter (the
+                    // perceived "crash"). Own the shutdown instead: forward the
+                    // disconnect so a healthy lldb-dap still detaches, answer
+                    // Zed ourselves, and exit 0. Teardown's bounded lldb-dap
+                    // wait-then-kill covers a wedged child; its belt-and-braces
+                    // `simctl terminate` still runs unless the process actually
+                    // exited (gated by debuggee_exited), so a detach here would
+                    // still terminate the app and we never step on a successor.
+                    log::info!(
+                        "disconnect received (seq {seq}) after session end — \
+                         answering and shutting down"
+                    );
+                    let _ = self.send_to_child_raw(raw);
+                    self.send_to_client(Out::Msg(peek::success_response(seq, "disconnect")));
+                    Ok(LoopAction::Exit(0))
                 } else {
-                    log::info!("disconnect received (seq {seq}) — forwarding to lldb-dap");
-                    // lldb-dap handles terminate/detach semantics per the
-                    // request; its response passes back through. Teardown
-                    // adds the belt-and-braces `simctl terminate`.
+                    // Live debuggee (no `exited`/`terminated` seen): forward so
+                    // lldb-dap terminates/detaches per the request; its response
+                    // and any `exited`/`terminated` pass back through, and its
+                    // exit normally breaks the loop into teardown. But against
+                    // the simulator debugserver lldb-dap can KILL the debuggee
+                    // on disconnect and then wedge without exiting (common when
+                    // a concurrent Rerun's install is contending on the same
+                    // bundle) — which would hang the loop until Zed force-kills
+                    // the adapter. So arm a bounded wait: if lldb-dap has not
+                    // exited by the deadline, we own the shutdown ourselves
+                    // (see the `disconnect_wait` arm in the routing loop).
+                    log::info!(
+                        "disconnect received (seq {seq}) — forwarding to lldb-dap (bounded)"
+                    );
                     self.send_to_child_raw(raw)?;
+                    self.disconnect_wait =
+                        Some((seq, tokio::time::Instant::now() + DISCONNECT_WEDGE_GRACE));
                     Ok(LoopAction::Continue)
                 }
             }
@@ -595,6 +706,24 @@ impl Proxy {
                 Ok(LoopAction::Continue)
             }
             ChildMsg::Other { raw } => {
+                // Track lldb-dap's end-of-session events so a following client
+                // `disconnect` is owned by us (see `on_client_message`).
+                // `exited` => the process is gone (also gates the teardown
+                // terminate-skip); a plain `terminated` is a detach — the app
+                // is still alive and must be terminated on Stop. `exited`
+                // precedes `terminated`, so the first terminal event decides
+                // both flags; the `!session_ended` guard keeps this to a single
+                // parse per session.
+                if !self.session_ended {
+                    if let Some(process_exited) = peek::terminal_event(raw) {
+                        self.session_ended = true;
+                        self.debuggee_exited = process_exited;
+                        log::info!(
+                            "lldb-dap ended the session (debuggee_exited={})",
+                            self.debuggee_exited
+                        );
+                    }
+                }
                 self.send_to_client(Out::Raw(raw.to_vec()));
                 Ok(LoopAction::Continue)
             }
@@ -641,6 +770,22 @@ impl Proxy {
                 ));
             }
         }
+    }
+
+    /// On a superseding SIGTERM/SIGINT (a newer run claimed our simulator, or
+    /// an external stop), emit a `terminated` event so Zed renders the adapter
+    /// exit as a clean session end rather than a crash. No-op before there is a
+    /// session to end, or if lldb-dap already ended it (Zed already knows).
+    fn announce_superseded(&mut self) {
+        if self.session_ended || (!self.attached && self.session.is_none()) {
+            return;
+        }
+        self.send_to_client(Out::Msg(peek::output_event(
+            "console",
+            "Superseded by a new run — stopping this session.\n",
+        )));
+        self.send_to_client(Out::Msg(peek::terminated_event()));
+        self.session_ended = true;
     }
 
     fn send_to_client(&self, out: Out) {
@@ -731,31 +876,39 @@ impl Proxy {
         }
 
         // Xcode Stop semantics: the app dies with the session — but only if
-        // it is still *our* app. A newer instance may have superseded us
-        // (Rerun / second session): it re-claimed the pidfile and SIGTERM'd
-        // us after launching its own app over ours, so a bundle-id terminate
-        // here would kill the successor's freshly launched app. Skip when
-        // superseded. Otherwise terminate when terminateOnStop is set, or
-        // whenever we never attached (a suspended app must not be left
-        // frozen). Bounded so a wedged simctl can't stall exit.
+        // it is still *our* app. Two ways it may not be: a newer instance
+        // superseded us (Rerun / second session re-claimed the pidfile and
+        // SIGTERM'd us after launching its own app over ours), or our own
+        // debuggee already exited (e.g. a successor's `simctl install`
+        // replaced the running bundle) — in both cases a bundle-id terminate
+        // here would hit the successor's app or nothing. Otherwise terminate
+        // when terminateOnStop is set, or whenever we never attached (a
+        // suspended `--wait-for-debugger` app must not be left frozen).
+        // Bounded so a wedged simctl can't stall exit.
         if let Some(mut done) = self.session.take() {
             if let Some(mut child) = done.mock_child.take() {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 log::info!("teardown: mock app killed");
-            } else if !self.superseded()
-                && (!self.attached || done.config.as_ref().is_some_and(|c| c.terminate_on_stop))
-            {
-                log::info!(
-                    "teardown: terminating {} on {}",
-                    done.app.bundle_id,
-                    done.app.udid
-                );
-                let _ = tokio::time::timeout(
-                    TEARDOWN_GRACE,
-                    simctl::terminate(&done.app.udid, &done.app.bundle_id),
-                )
-                .await;
+            } else {
+                let terminate_on_stop = done.config.as_ref().is_some_and(|c| c.terminate_on_stop);
+                if should_terminate_on_teardown(
+                    self.attached,
+                    terminate_on_stop,
+                    self.superseded(),
+                    self.debuggee_exited,
+                ) {
+                    log::info!(
+                        "teardown: terminating {} on {}",
+                        done.app.bundle_id,
+                        done.app.udid
+                    );
+                    let _ = tokio::time::timeout(
+                        TEARDOWN_GRACE,
+                        simctl::terminate(&done.app.udid, &done.app.bundle_id),
+                    )
+                    .await;
+                }
             }
         }
 
@@ -911,4 +1064,47 @@ where
         let _ = sink.shutdown().await;
     });
     (tx, handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_terminate_on_teardown;
+
+    #[test]
+    fn terminates_attached_app_with_terminate_on_stop() {
+        // Normal Stop of a live, attached app: terminate it.
+        assert!(should_terminate_on_teardown(true, true, false, false));
+    }
+
+    #[test]
+    fn keeps_attached_app_when_opted_out() {
+        // terminateOnStop=false leaves an attached app running on Stop.
+        assert!(!should_terminate_on_teardown(true, false, false, false));
+    }
+
+    #[test]
+    fn terminates_never_attached_suspended_app() {
+        // Never attached: the app is suspended under --wait-for-debugger and
+        // must not be left frozen, regardless of terminateOnStop.
+        assert!(should_terminate_on_teardown(false, false, false, false));
+    }
+
+    #[test]
+    fn skips_terminate_when_superseded() {
+        // A successor re-claimed the pidfile: never terminate (would kill its
+        // freshly launched app).
+        assert!(!should_terminate_on_teardown(true, true, true, false));
+        assert!(!should_terminate_on_teardown(false, false, true, false));
+    }
+
+    #[test]
+    fn skips_terminate_when_debuggee_exited() {
+        // Regression: the second-⌘R crash path. Our debuggee already exited
+        // (its bundle was replaced by a successor's install), so there is
+        // nothing of ours to terminate and the bundle id may now be the
+        // successor's — never terminate, in every attach/opt-out combination.
+        assert!(!should_terminate_on_teardown(true, true, false, true));
+        assert!(!should_terminate_on_teardown(true, false, false, true));
+        assert!(!should_terminate_on_teardown(false, false, false, true));
+    }
 }
