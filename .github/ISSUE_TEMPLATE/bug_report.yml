@@ -1,0 +1,45 @@
+name: Bug report
+description: Report a problem with ZedXcode (the xcode-dap proxy or the Xcode Tools extension).
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `xcode-dap doctor`
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Relevant log excerpt
+      description: >-
+        A relevant excerpt of `~/.zedxcode/logs/xcode-dap.log`. Setting
+        `XCODE_DAP_LOG=debug` and reproducing gives richer logs.
+    validations:
+      required: false
+
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: >-
+        Output of `xcode-dap --version`, your Zed version, and your macOS and
+        Xcode versions.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: false

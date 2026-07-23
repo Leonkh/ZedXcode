@@ -1,0 +1,18 @@
+[package]
+name = "zed-xcode-ext"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7.0"
+serde_json = "1"
+xcode-dap-config = { path = "../crates/xcode-dap-config" }
+
+# Standalone package — excluded from the root workspace on purpose:
+# Zed's extension builder compiles this dir independently for wasm32-wasip2.
+[workspace]

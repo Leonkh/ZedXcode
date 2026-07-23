@@ -1,0 +1,75 @@
+# Release pipeline for the xcode-dap proxy binary.
+#
+# Triggered by tags like `xcode-dap-v0.1.0`. Produces per-arch tar.gz assets
+# whose names MUST match the contract in extension/src/lib.rs
+# (cached_or_downloaded_proxy):
+#
+#   <tag>-<arch>-apple-darwin.tar.gz        arch ∈ {aarch64, x86_64}
+#   e.g. xcode-dap-v0.1.0-aarch64-apple-darwin.tar.gz
+#
+# Each archive contains a single ad-hoc-signed `xcode-dap` binary at the
+# archive root.
+
+name: Release xcode-dap
+
+on:
+  push:
+    tags:
+      - "xcode-dap-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build, sign and release
+    runs-on: macos-14
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build (aarch64-apple-darwin)
+        run: cargo build --release --locked -p xcode-dap --target aarch64-apple-darwin
+
+      - name: Build (x86_64-apple-darwin)
+        run: cargo build --release --locked -p xcode-dap --target x86_64-apple-darwin
+
+      - name: Sanity-check binary version against the tag
+        run: |
+          set -euo pipefail
+          version="$(./target/aarch64-apple-darwin/release/xcode-dap --version | awk '{print $2}')"
+          expected="${GITHUB_REF_NAME#xcode-dap-v}"
+          echo "binary: $version / tag: $expected"
+          test "$version" = "$expected"
+
+      - name: Sign and package
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in aarch64 x86_64; do
+            bin="target/${arch}-apple-darwin/release/xcode-dap"
+            # Ad-hoc signature: arm64 macOS refuses to run unsigned binaries,
+            # and Zed's downloader does not quarantine files, so this is enough.
+            codesign --force -s - "$bin"
+            # Single binary at the archive root (extension/src/lib.rs contract).
+            # COPYFILE_DISABLE prevents macOS tar from adding ._* entries.
+            COPYFILE_DISABLE=1 tar -czf \
+              "dist/${TAG}-${arch}-apple-darwin.tar.gz" \
+              -C "target/${arch}-apple-darwin/release" xcode-dap
+          done
+          (cd dist && shasum -a 256 ./*.tar.gz | tee SHA256SUMS.txt)
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            dist/*.tar.gz dist/SHA256SUMS.txt \
+            --title "$TAG" \
+            --notes "xcode-dap release \`$TAG\`: per-arch macOS binaries (ad-hoc signed) for the Xcode Tools Zed extension. Checksums in SHA256SUMS.txt."

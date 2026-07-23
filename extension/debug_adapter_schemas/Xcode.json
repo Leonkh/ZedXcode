@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Xcode debug adapter configuration",
+  "description": "Scenario config for the `Xcode` adapter (ZedXcode). Mirrors `LaunchConfig` in crates/xcode-dap-config; consumed by the `xcode-dap` proxy as the DAP `launch` request arguments.",
+  "type": "object",
+  "required": ["workspace", "scheme"],
+  "properties": {
+    "workspace": {
+      "type": "string",
+      "description": "Path to the .xcworkspace (or .xcodeproj) to build, e.g. \"$ZED_WORKTREE_ROOT/MyApp.xcworkspace\". Zed task variables are substituted before launch."
+    },
+    "scheme": {
+      "type": "string",
+      "description": "Xcode scheme to build and run, e.g. \"MyApp\"."
+    },
+    "device": {
+      "type": "string",
+      "description": "Simulator device name (e.g. \"iPhone 15 Pro Max\") or UDID. A booted simulator matching it is preferred. If omitted, the booted iPhone simulator is used, else the newest available iPhone."
+    },
+    "os": {
+      "type": "string",
+      "description": "Simulator OS version to narrow device matching, e.g. \"26.3\". Defaults to the newest runtime available for the device."
+    },
+    "configuration": {
+      "type": "string",
+      "description": "Build configuration, e.g. \"Debug\" or \"Release\". Defaults to the scheme's default configuration."
+    },
+    "preflight": {
+      "type": "string",
+      "description": "Shell command run before the build when the workspace file is missing (project generation), e.g. \"make project CI=true\"."
+    },
+    "oslog": {
+      "type": "boolean",
+      "default": false,
+      "description": "Also pump OSLog output (`log stream --predicate`) into the Debug Console, in addition to the app's stdout/stderr. By default only the app's own logging is shown (subsystem == bundle id, or any binary image inside the .app bundle); set `oslogPredicate` to override."
+    },
+    "oslogPredicate": {
+      "type": "string",
+      "description": "Custom NSPredicate for the OSLog pump, passed to `log stream --predicate`, e.g. \"subsystem == \\\"com.example.app\\\"\". Overrides the default app-scoped predicate. Only used when `oslog` is true."
+    },
+    "terminateOnStop": {
+      "type": "boolean",
+      "default": true,
+      "description": "Terminate the app on the simulator when the debug session stops (Xcode Stop semantics)."
+    },
+    "buildOutput": {
+      "type": "string",
+      "enum": ["filtered", "full"],
+      "default": "filtered",
+      "description": "Build-log verbosity in the Debug Console: \"filtered\" shows phase headers, diagnostics and the final verdict; \"full\" streams the entire xcodebuild log."
+    },
+    "verboseLogging": {
+      "type": "boolean",
+      "default": false,
+      "description": "Log this debug session at trace verbosity (DAP frame summaries and bodies, engine commands) to ~/.zedxcode/logs/xcode-dap.log. Takes effect at the launch request (which is replayed into the log); frames before launch (e.g. initialize) are only captured with the XCODE_DAP_LOG environment variable. Never lowers a level already raised via XCODE_DAP_LOG."
+    },
+    "derivedData": {
+      "type": "string",
+      "description": "Explicit DerivedData directory, mapped to `xcodebuild -derivedDataPath`. Defaults to xcodebuild's per-workspace DerivedData location when omitted."
+    }
+  }
+}

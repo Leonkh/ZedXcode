@@ -1,0 +1,8 @@
+target/
+extension/extension.wasm
+.DS_Store
+*.zedxcode-backup-*
+
+# Local Claude Code guidance — never ship (may reference internal context)
+/.claude/
+/CLAUDE.md

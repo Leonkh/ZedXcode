@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = ["crates/xcode-dap", "crates/xcode-dap-config"]
+# extension/ is EXCLUDED from the workspace — Zed's extension builder
+# compiles it independently for wasm32-wasip2.
+exclude = ["extension"]
