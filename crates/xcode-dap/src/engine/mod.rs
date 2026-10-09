@@ -17,3 +17,4 @@ pub mod selection;
 pub mod simctl;
 pub mod xcactivitylog;
 pub mod xcodebuild;
+pub mod xcscheme;
