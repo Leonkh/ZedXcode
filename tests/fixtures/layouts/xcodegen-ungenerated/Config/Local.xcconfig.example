@@ -1,0 +1,6 @@
+// Machine-local build settings for this fixture.
+//
+// Copy to Config/Local.xcconfig (git-ignored) to use it. A linked git worktree
+// does not have the copy; ZedXcode's carry list copies it over from the main
+// checkout. Nothing in the project requires it, so the fixture builds either way.
+MYAPP_LOCAL_NOTE = example

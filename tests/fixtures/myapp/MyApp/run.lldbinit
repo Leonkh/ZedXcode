@@ -1,0 +1,5 @@
+# Sourced by the MyApp scheme (LaunchAction customLLDBInitFile =
+# $(SRCROOT)/MyApp/run.lldbinit). One harmless, distinctive setting, so a check
+# can tell this file took effect: `settings show target.max-string-summary-length`
+# prints 777 instead of LLDB's default 1024.
+settings set target.max-string-summary-length 777
