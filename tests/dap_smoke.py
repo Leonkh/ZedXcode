@@ -511,8 +511,12 @@ def kill_after_response(client, rec, started: dict, home: str, dummy_pid) -> Non
     # The adapter's own children (lldb-dap, the mock app, the log stream
     # stand-in) are the ones it reaps before answering. Their children
     # (lldb-dap's debugserver / lldb-server) may take a moment longer to go
-    # and are left to the check after the SIGKILL.
+    # and are left to the check after the SIGKILL. On macOS a process the
+    # debugger has attached to shows debugserver as its parent, so the mock
+    # app is found by the pid it announced rather than by parentage.
     own = children_of(adapter_pid)
+    if dummy_pid is not None and pid_alive(dummy_pid):
+        own.setdefault(dummy_pid, started.get(dummy_pid, "mock_app"))
     verify(
         "mock_app" in own.values() and "sleep" in own.values(),
         "the mock app and the log stream stand-in are the adapter's own children "
