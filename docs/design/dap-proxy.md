@@ -294,7 +294,7 @@ Plus pure-Rust unit tests: framing codec (split headers, multi-message reads), p
 | 4 | minimal dev extension (wasip2, registers "Xcode", schema) — coordinate with sibling agent | `zed: install dev extension` + `dap.Xcode.binary` override → New Session shows "Xcode"; first run via modal, then **CMD+R = debugger::Rerun** rebuilds+relaunches+reattaches with console in Debug Console (manual keybinding for now) |
 | 5 | `setup` (jsonc merge port, user + project), `doctor`, `refresh`; tasks for CMD+B / CMD+Shift+K | Fresh-machine dry run on a real iOS project: setup → CMD+R/CMD+B/CMD+Shift+K/CMD+Shift+O all work; cmd-k chords still work; backups created; re-run idempotent |
 | 6 | oslog flag, build-log filter polish | oslog stream interleaves in the Debug Console; filtered build output stays readable, full log on disk |
-| 7 | Release: GitHub Actions (macOS arm64+x86_64, `codesign -s -` ad-hoc, tar.gz + sha256), extension download path, README, publish PR to zed-industries/extensions | Clean machine: install from registry → setup → CMD+R works without local cargo |
+| 7 | Release: GitHub Actions (macOS arm64 only, `codesign -s -` ad-hoc, tar.gz + sha256), extension download path, README, publish PR to zed-industries/extensions | Clean machine: install from registry → setup → CMD+R works without local cargo |
 
 ## 10. Risks (proxy-specific)
 

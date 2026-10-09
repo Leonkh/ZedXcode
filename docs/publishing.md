@@ -19,15 +19,17 @@ GitHub releases produced by [`.github/workflows/release.yml`](../.github/workflo
       contains neither `zed` nor `extension` (immutable after publish).
 - [ ] `extension/` builds for `wasm32-wasip2` with a rustup toolchain:
       `cargo build --release --target wasm32-wasip2` inside `extension/`.
-- [ ] A `xcode-dap-v<version>` GitHub release exists with **both** arch assets
-      (`<tag>-aarch64-apple-darwin.tar.gz`, `<tag>-x86_64-apple-darwin.tar.gz`)
+- [ ] A `xcode-dap-v<version>` GitHub release exists with the Apple silicon
+      asset `<tag>-aarch64-apple-darwin.tar.gz` and `SHA256SUMS.txt`,
       matching `PROXY_TAG` in `extension/src/lib.rs` — push the tag and let
-      the release workflow produce them.
-- [ ] The version is consistent in all four places: `extension/extension.toml`
-      `version`, the `PROXY_TAG` constant, the git tag of the release, and the
-      `xcode-dap` crate version (`crates/xcode-dap/Cargo.toml`). Release CI
-      hard-fails the tag build unless `xcode-dap --version` equals the tag
-      suffix, so a crate/tag mismatch never reaches a published release.
+      the release workflow produce them. There is no Intel asset: Intel Macs
+      are not supported.
+- [ ] The git tag of the release equals all five version declarations:
+      `crates/xcode-dap/Cargo.toml`, `crates/xcode-dap-config/Cargo.toml`,
+      `extension/Cargo.toml`, `extension/extension.toml` `version`, and the
+      `PROXY_TAG` constant. `scripts/check-versions.sh <tag>` checks them;
+      release CI runs it with the pushed tag and hard-fails on any mismatch,
+      so a version/tag mismatch never reaches a published release.
 - [ ] The extension has been tested end-to-end as an installed dev extension
       (build, then a real debug run: cmd-R to launch with a breakpoint hit)
       before opening the PR — the Zed team closes untested submissions
@@ -70,11 +72,21 @@ same version, even when only the extension changed:
 
 1. Bump `version` in `extension/extension.toml` (e.g. `0.2.0`).
 2. Bump `PROXY_TAG` in `extension/src/lib.rs` to `xcode-dap-v0.2.0` and the
-   `xcode-dap` crate version (`crates/xcode-dap/Cargo.toml`) to match — release
-   CI hard-fails if the crate version and the tag disagree.
-3. Tag and push `xcode-dap-v0.2.0` — the release workflow builds, signs and
-   uploads both arch assets. Verify the asset names against the contract in
-   `extension/src/lib.rs` before proceeding.
+   three crate versions (`crates/xcode-dap/Cargo.toml`,
+   `crates/xcode-dap-config/Cargo.toml`, `extension/Cargo.toml`) to match —
+   `scripts/check-versions.sh xcode-dap-v0.2.0` must pass, and release CI
+   hard-fails if any declaration and the tag disagree. Then refresh both
+   lockfiles: run `cargo update --workspace --offline` at the repository root
+   and again in `extension/`, and commit `Cargo.lock` and
+   `extension/Cargo.lock` with the bump. Every `--locked` build, the release
+   gate included, fails on a lockfile that still records the old versions.
+3. Tag and push `xcode-dap-v0.2.0` — the release workflow runs the gate,
+   then builds, signs and uploads the Apple silicon asset and
+   `SHA256SUMS.txt`. Verify the asset name against the contract in
+   `extension/src/lib.rs` before proceeding. To rehearse first, run the
+   workflow by hand (`workflow_dispatch`): that dry run builds, signs and
+   packages the same files and keeps them as a workflow artifact, without
+   creating a release.
 4. In the `zed-industries/extensions` fork:
 
    ```sh

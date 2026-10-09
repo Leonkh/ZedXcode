@@ -184,7 +184,7 @@ Signatures verified from WIT/docs.rs: `latest_github_release(repo, GithubRelease
 ### Gatekeeper / quarantine / signing (verified + cited)
 
 - **Zed's `download_file` produces non-quarantined files.** Zed downloads via its own HTTP client (`wasm_host` `download_file` → `self.host.http_client.get(...)`, raw stream-to-disk); `com.apple.quarantine` is only attached by apps that opt in via `LSFileQuarantineEnabled` — Zed.app's Info.plist does **not** set it (checked locally with `defaults read`), and empirically this machine's `~/Library/Application Support/Zed/debug_adapters/` carries only `com.apple.provenance`, no quarantine xattr. Gatekeeper only assesses quarantined files, so **no notarization or Developer ID is required** for this delivery path. ([HackTricks on quarantine/LSFileQuarantineEnabled](https://hacktricks.wiki/en/macos-hardening/macos-security-and-privilege-escalation/macos-security-protections/macos-gatekeeper.html), [Red Canary on Gatekeeper](https://redcanary.com/blog/threat-detection/gatekeeper/))
-- **arm64 macOS still requires *some* code signature to execute.** Rust release binaries built on/for Apple Silicon are automatically ad-hoc "linker-signed"; add an explicit `codesign --force -s - target/.../xcode-dap` step in release CI to make it deterministic for both arches. Ship two per-arch tar.gz assets (simpler than universal lipo).
+- **arm64 macOS still requires *some* code signature to execute.** Rust release binaries built on/for Apple Silicon are automatically ad-hoc "linker-signed"; add an explicit `codesign --force -s - target/.../xcode-dap` step in release CI to make it deterministic. Ship one Apple silicon tar.gz asset (`aarch64-apple-darwin`); Intel Macs are not supported, so there is no Intel asset.
 - **Caveat to document:** if a user downloads the binary with a browser (quarantining app), ad-hoc + quarantine = Gatekeeper block ([pnpm hit exactly this with ad-hoc-signed `.node` files](https://github.com/pnpm/pnpm/issues/11056)). The README's manual-install path must use `curl -L` (curl does not quarantine) or `xattr -d com.apple.quarantine`.
 
 ---
@@ -253,7 +253,7 @@ Publishing checklist (per v1.6.3 docs + live registry):
    version = "0.1.0"           # must equal extension.toml version
    ```
    `pnpm sort-extensions`, PR.
-4. Updates: bump `extension/extension.toml` version + tag a matching `xcode-dap-v*` release with both arch assets, then `git submodule update --remote extensions/xcode-tools` + bump `version` in `extensions.toml`, PR.
+4. Updates: bump `extension/extension.toml` version + tag a matching `xcode-dap-v*` release with its Apple silicon asset, then `git submodule update --remote extensions/xcode-tools` + bump `version` in `extensions.toml`, PR.
 
 `Cargo.toml` for the extension crate:
 
@@ -293,7 +293,7 @@ ZedXcode/
 │   └── xcode-dap-config/           # shared serde structs for the scenario config JSON
 │                                   #   (pure serde/no-IO → compiles for both wasm32-wasip2 and aarch64-apple-darwin;
 │                                   #    single source of truth so extension schema, extension parsing and proxy parsing never drift)
-└── .github/workflows/release.yml   # cargo build --release (both arches) → codesign -s - → tar.gz assets on xcode-dap-v* tags
+└── .github/workflows/release.yml   # gate → cargo build --release (aarch64 only) → codesign -s - → tar.gz asset on xcode-dap-v* tags
 ```
 
 Registry interaction: the **whole repo** becomes the submodule; `path = "extension"` points the registry's packaging at the extension dir, whose `cargo build --target wasm32-wasip2` resolves the `xcode-dap-config` path-dependency inside the submodule. The native proxy is never compiled or shipped by the registry — it arrives via the pinned GitHub release (§3). Keep `extension/` free of any `process:exec` usage so the manifest needs no capabilities.
