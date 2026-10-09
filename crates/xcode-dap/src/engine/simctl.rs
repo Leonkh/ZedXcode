@@ -67,10 +67,16 @@ impl Step {
 }
 
 /// Deadline for the quick helpers around the simulator window and the
-/// first-launch check (`xcode-select -p`, `open`, `xcodebuild
+/// first-launch check (`xcode-select -p`, `xcodebuild
 /// -checkFirstLaunchStatus`): each answers in a second or two, and a hung one
 /// gives up long before the boot phase's budget runs out.
 const HELPER_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Deadline for one `open` of the simulator window. The first launch of an
+/// app inside a freshly installed Xcode can take a minute while macOS
+/// verifies the bundle; the window opens concurrently with the `bootstatus`
+/// wait, so this patience costs a run nothing in the common case.
+const WINDOW_OPEN_DEADLINE: Duration = Duration::from_secs(60);
 
 /// `xcrun simctl list devices --json` -> match by udid-or-name (+ optional
 /// OS runtime), prefer Booted, deterministic sort. Returns the UDID.
@@ -223,11 +229,11 @@ const BOOT_RETRY_BUDGET: Duration = Duration::from_secs(30);
 const BOOT_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// `xcrun simctl boot <udid>` (tolerating "already booted/booting",
-/// retrying a "Shutting Down" race) + the simulator window
-/// ([`open_simulator_window`], never fatal) + `xcrun simctl bootstatus
-/// <udid>` (blocks until ready, no-op when already booted).
+/// retrying a "Shutting Down" race), then the simulator window
+/// ([`open_simulator_window`], never fatal) concurrently with `xcrun simctl
+/// bootstatus <udid>` (blocks until ready, no-op when already booted).
 ///
-/// Ordered this way because opening the simulator window first lets it
+/// The window opens only after `simctl boot`: opening it first lets it
 /// auto-boot the same device concurrently, making a `bootstatus -b` inner
 /// boot fail with SimError 405 "Unable to boot device in current state:
 /// Booted".
@@ -270,13 +276,15 @@ pub async fn boot(udid: &str, sink: &dyn OutputSink) -> anyhow::Result<()> {
             stderr.trim()
         );
     }
-    open_simulator_window(sink).await;
-    run_ok(
-        Command::new("xcrun").args(["simctl", "bootstatus", udid]),
-        "xcrun simctl bootstatus",
-    )
-    .await?;
-    Ok(())
+    // The window opens while `bootstatus` waits: it is cosmetic, and a slow
+    // first launch of the window app must not hold up the boot.
+    let mut bootstatus = Command::new("xcrun");
+    bootstatus.args(["simctl", "bootstatus", udid]);
+    let ((), status) = tokio::join!(
+        open_simulator_window(sink),
+        run_ok(&mut bootstatus, "xcrun simctl bootstatus"),
+    );
+    status
 }
 
 /// `simctl boot` fails with SimError 405 when the device is already
@@ -357,6 +365,7 @@ async fn open_simulator_window(sink: &dyn OutputSink) {
     // The reason the preferred app did not open is the one worth showing.
     let mut first_error: Option<String> = None;
     for app in &candidates {
+        log::info!(target: "simctl", "simulator window: opening {}", app.display());
         let mut cmd = Command::new("open");
         cmd.arg(app);
         match open_app(&mut cmd, "open <simulator app>").await {
@@ -364,7 +373,20 @@ async fn open_simulator_window(sink: &dyn OutputSink) {
                 log::info!(target: "simctl", "simulator window: opened {}", app.display());
                 return;
             }
-            Err(e) => {
+            Err(OpenError::NoAnswer(e)) => {
+                // Still launching, most likely: trying the next app now could
+                // open a second window app next to it.
+                log::warn!(
+                    target: "simctl",
+                    "simulator window: {} did not answer in {} s; it may still be starting",
+                    app.display(),
+                    WINDOW_OPEN_DEADLINE.as_secs()
+                );
+                let line = window_failure_message(&e);
+                sink.line("console", &line);
+                return;
+            }
+            Err(OpenError::Failed(e)) => {
                 // A warning even when a later app opens: on Xcode 27 an older
                 // Simulator.app reached through `open -a Simulator` hides a
                 // Device Hub that does not open.
@@ -384,7 +406,7 @@ async fn open_simulator_window(sink: &dyn OutputSink) {
             target: "simctl",
             "simulator window: opened Simulator (open -a Simulator)"
         ),
-        Err(e) => {
+        Err(OpenError::NoAnswer(e) | OpenError::Failed(e)) => {
             let line = window_failure_message(first_error.as_deref().unwrap_or(&e));
             log::warn!(target: "simctl", "{line}");
             sink.line("console", &line);
@@ -392,16 +414,28 @@ async fn open_simulator_window(sink: &dyn OutputSink) {
     }
 }
 
-/// Run one `open` for the simulator window; `Err` carries a one-line reason.
-async fn open_app(cmd: &mut Command, what: &str) -> Result<(), String> {
-    match output_within(cmd, what, HELPER_DEADLINE).await {
+/// Why one `open` of the simulator window did not succeed, as a one-line
+/// reason.
+enum OpenError {
+    /// `open` did not return within [`WINDOW_OPEN_DEADLINE`].
+    NoAnswer(String),
+    /// `open` failed or could not be run.
+    Failed(String),
+}
+
+/// Run one `open` for the simulator window.
+async fn open_app(cmd: &mut Command, what: &str) -> Result<(), OpenError> {
+    match output_within(cmd, what, WINDOW_OPEN_DEADLINE).await {
         Ok(Some(out)) if out.status.success() => Ok(()),
-        Ok(Some(out)) => Err(failure_reason(
+        Ok(Some(out)) => Err(OpenError::Failed(failure_reason(
             &out.status.to_string(),
             &String::from_utf8_lossy(&out.stderr),
-        )),
-        Ok(None) => Err(format!("no answer in {} s", HELPER_DEADLINE.as_secs())),
-        Err(e) => Err(failure_reason(&format!("{e:#}"), "")),
+        ))),
+        Ok(None) => Err(OpenError::NoAnswer(format!(
+            "no answer in {} s",
+            WINDOW_OPEN_DEADLINE.as_secs()
+        ))),
+        Err(e) => Err(OpenError::Failed(failure_reason(&format!("{e:#}"), ""))),
     }
 }
 
