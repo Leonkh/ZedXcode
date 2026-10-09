@@ -19,7 +19,8 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-work="$(mktemp -d "${TMPDIR:-/tmp}/zedx-fixtures.XXXXXX")"
+tmp="${TMPDIR:-/tmp}" # macOS ends TMPDIR in "/"
+work="$(mktemp -d "${tmp%/}/zedx-fixtures.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
 # Copy tests/fixtures into $work, keeping modes (generate.sh must stay

@@ -9,7 +9,8 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-work="$(mktemp -d "${TMPDIR:-/tmp}/zedx-deps.XXXXXX")"
+tmp="${TMPDIR:-/tmp}" # macOS ends TMPDIR in "/"
+work="$(mktemp -d "${tmp%/}/zedx-deps.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
 cargo metadata --no-deps --format-version 1 \

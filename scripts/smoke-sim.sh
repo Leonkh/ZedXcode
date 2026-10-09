@@ -114,7 +114,8 @@ log_dir="$(cd "$log_dir" && pwd)"
 zedxcode="$HOME/.zedxcode"
 xcode_dap_log="$zedxcode/logs/xcode-dap.log"
 
-work="$(mktemp -d "${TMPDIR:-/tmp}/zedx-smoke.XXXXXX")"
+tmp="${TMPDIR:-/tmp}" # macOS ends TMPDIR in "/"
+work="$(mktemp -d "${tmp%/}/zedx-smoke.XXXXXX")"
 # Copy the fixture without any build output or per-user Xcode state.
 mkdir -p "$work/fixture"
 cp -R "$fixture/." "$work/fixture/"

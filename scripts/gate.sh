@@ -23,7 +23,8 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"
 
-work="$(mktemp -d "${TMPDIR:-/tmp}/zedx-gate.XXXXXX")"
+tmp="${TMPDIR:-/tmp}" # macOS ends TMPDIR in "/"
+work="$(mktemp -d "${tmp%/}/zedx-gate.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export HOME="$work/home" TMPDIR="$work/tmp"

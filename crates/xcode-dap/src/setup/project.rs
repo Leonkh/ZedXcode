@@ -1353,10 +1353,13 @@ mod tests {
     #[test]
     fn find_workspace_prefers_xcworkspace_and_detects_ambiguity() {
         let dir = sandbox();
+        // Discovery reports the root in normal form: a TMPDIR ending in "/"
+        // (macOS) can leave a "//" in the sandbox path.
+        let root = std::path::absolute(&dir).unwrap();
         assert!(find_workspace(&dir)
             .unwrap_err()
             .to_string()
-            .starts_with(&format!("No Xcode project in {}: ", dir.display())));
+            .starts_with(&format!("No Xcode project in {}: ", root.display())));
         fs::create_dir(dir.join("app.xcodeproj")).unwrap();
         assert_eq!(find_workspace(&dir).unwrap(), "app.xcodeproj");
         fs::create_dir(dir.join("app.xcworkspace")).unwrap();

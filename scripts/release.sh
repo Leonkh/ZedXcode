@@ -126,7 +126,8 @@ if [[ "$current" =~ $version_re ]] && version_lt "$version" "$current"; then
   exit 2
 fi
 
-work="$(mktemp -d "${TMPDIR:-/tmp}/zedx-release.XXXXXX")"
+tmp="${TMPDIR:-/tmp}" # macOS ends TMPDIR in "/"
+work="$(mktemp -d "${tmp%/}/zedx-release.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 old="$work/old" # the seven files as they are now
 new="$work/new" # a copy of what cargo reads, where the changes are made
