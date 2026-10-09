@@ -257,6 +257,9 @@ navigation keeps working against the new project.
 
 ## Known limitations
 
+- **Macs whose only Xcode is Xcode 27:** v0.1.0 needs Simulator.app, which
+  Xcode 27 replaced with Device Hub, so every ⌘R stops in the boot phase.
+  Until the next release, keep an Xcode 26 installed alongside.
 - **First ⌘R after a Zed restart opens the New Session modal** — Zed's
   `debugger::Rerun` needs one scenario pick per app session. Pick once, then
   the rerun loop resumes.
