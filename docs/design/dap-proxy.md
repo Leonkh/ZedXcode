@@ -246,17 +246,24 @@ Verified: **no clear-console action exists** in Zed's debugger (console namespac
 
 ### 6.1 `setup` — port the verified JSONC marker-merge to Rust (decision: Rust, not Python)
 
-One binary, zero runtime deps (host python3 is 3.9 and another dep to doctor) — and the merge logic is mechanical text surgery, not parsing-heavy. Port the existing verified design 1:1:
+One binary, zero runtime deps (host python3 is 3.9 and another dep to doctor) — and the merge logic is mechanical text surgery, not parsing-heavy. Ported from the verified design, with blocks owned by hash since 0.2:
 
 ```rust
-// setup/jsonc.rs
-pub fn merge_marker_block(path: &Path, marker_id: &str, block: &str) -> Result<MergeOutcome>
-// 1. read file; timestamped backup "<file>.zedxcode-backup-<ts>"
-// 2. if "// >>> zedxcode:<id> >>>" .. "// <<< zedxcode:<id> <<<" exists → replace inner text
-// 3. else find insertion point: scan from EOF backwards for the final ']' / '}' of the
-//    top-level value using a tolerant scanner (tracks "strings", // and /* */ comments);
-//    insert ",\n" + block before it (handles JSONC trailing commas/comments without a parser)
-// 4. atomic write (tmp + rename)
+// setup/jsonc.rs — plan on text first (a dry run shows exactly what a real run writes)
+pub fn plan_merge(text: &str, spec: &BlockSpec, on_edited: OnEdited) -> Result<BlockChange>
+pub fn plan_remove(text: &str, spec: &BlockSpec, on_edited: OnEdited) -> Result<BlockChange>
+pub fn write_change(path: &Path, original: &str, change: &BlockChange) -> Result<Option<PathBuf>>
+// markers: "// >>> zedxcode:<id> v2 h=<fnv1a64 of the inner text, 16 hex> >>>" .. "// <<< zedxcode:<id> <<<"
+// 1. ours = the inner text still hashes to h, or (0.1's unversioned "// >>> zedxcode:<id> >>>")
+//    it equals 0.1's block byte for byte, or it holds exactly our entries (only formatting differs)
+// 2. ours → rewrite in place; absent → insert right after the opening '[' / '{' of the top-level
+//    value (Zed's own writers append at the end, which once put their entries inside our markers)
+// 3. edited by hand → left unchanged, foreign entries listed; --relocate moves them below the
+//    end marker verbatim (comments travel with their entry; in a keymap the later binding wins),
+//    then rewrites ours; --replace overwrites; --remove deletes only blocks that are ours
+// 4. a string- and comment-aware scanner finds the opener and splits elements / members;
+//    timestamped backup "<file>.zedxcode-backup-<ts>"; atomic write (tmp + rename);
+//    post-write validation, original restored on failure
 ```
 
 User-level (`--user`): keymap.json gets the marker block binding `cmd-r → debugger::Rerun`, `cmd-b`/`cmd-shift-k` → `task::Spawn {"task_name": "Xcode: Build"/"Xcode: Clean"}`, `cmd-shift-o → project_symbols::Toggle` — exactly the bindings already verified to coexist with `cmd-k` chords. Project-level: `.zed/debug.json` (adapter "Xcode" scenario with the project's workspace/scheme/device + the detected `"preflight"` command for generated projects), `.zed/tasks.json` (Build/Clean/Refresh/Console + Choose Scheme/Choose Destination pickers, all invoking `xcode-dap` by absolute binary path — Zed task shells don't have a dev install on PATH), `buildServer.json` written by the pure-Rust generator (`setup/build_server.rs`), whose `argv` points back at `xcode-dap bsp` — the toolkit's own built-in Build Server for sourcekit-lsp (see [`bsp-server.md`](bsp-server.md)) — append generated files to `.git/info/exclude`. Idempotent re-runs (marker replace), `--yes` for non-interactive. `--oslog` writes `"oslog": true` into the generated debug.json; without the flag a re-run preserves the value already in the existing file (enabled oslog is never silently reset).

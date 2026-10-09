@@ -45,7 +45,7 @@ enum Command {
     SelectScheme(commands::select::SelectSchemeArgs),
     /// Pick the simulator destination (interactive; writes .zed/.zedx/selection.json)
     SelectDevice(commands::select::SelectDeviceArgs),
-    /// Install Zed user keymap/settings blocks and per-project config
+    /// Install the Zed user keymap block and per-project config
     Setup(commands::setup::SetupArgs),
     /// Re-run preflight (project regen) and refresh buildServer.json; prints LSP-restart hint
     Refresh,
