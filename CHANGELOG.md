@@ -40,6 +40,19 @@ Tested with: recorded when this becomes a release.
   missing keys and the exact `setup --project` command that writes them.
 - Releases are built on macOS 26 and published only after the gate passes; the
   release workflow can also run as a dry run that publishes nothing.
+- `setup --project` and `select-scheme` find the Xcode workspace or project
+  up to two folders below the project root, such as `ios/MyApp.xcworkspace`
+  in a React Native app. They skip `Pods`, `node_modules`, build output,
+  hidden folders, bundles such as playgrounds, and nested git checkouts
+  (submodules, worktrees). A shallower container wins, and a workspace wins
+  over a project in the same folder; when several still tie, they list all of
+  them instead of picking one. When a `project.yml` or Tuist manifest has not
+  generated its project yet, they say so and name the command that generates
+  it. `doctor` uses the same search, but takes a container below the folder
+  it runs in only when that folder holds `.zed/` or `buildServer.json` or is
+  a git repository's top folder.
+- `select-scheme` refreshes `buildServer.json` in the project root, where
+  `setup` writes it, also when the workspace is in a subfolder.
 
 ### Removed
 

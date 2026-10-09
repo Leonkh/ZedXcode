@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
+use crate::engine::project;
 use crate::setup::jsonc;
 use crate::util::paths::container_flag;
 
@@ -31,9 +32,10 @@ pub struct ProjectFlags {
 /// Resolved per-project configuration written into `.zed/`.
 #[derive(Debug, Clone)]
 pub struct ProjectConfig {
-    /// Workspace/project file name, relative to the project dir
-    /// (e.g. `MyApp.xcworkspace`). Absolute only when `--workspace`
-    /// pointed outside the project dir (rendered verbatim then).
+    /// Workspace/project path, relative to the project dir
+    /// (e.g. `MyApp.xcworkspace` or `ios/MyApp.xcworkspace`). Absolute only
+    /// when `--workspace` pointed outside the project dir (rendered verbatim
+    /// then).
     pub workspace: String,
     pub scheme: String,
     pub device: String,
@@ -141,39 +143,12 @@ fn normalize_workspace_flag(dir: &Path, workspace: &Path) -> String {
     }
 }
 
-/// Find the single top-level `*.xcworkspace` (else `*.xcodeproj`) in `dir`.
+/// The container to write into `.zed/`, relative to `dir`: what
+/// [`project::discover`] finds within two levels (`ios/MyApp.xcworkspace`).
+/// A tie or no container points at `--workspace`, which skips this search.
 fn find_workspace(dir: &Path) -> Result<String> {
-    let mut workspaces = vec![];
-    let mut projects = vec![];
-    for entry in fs::read_dir(dir).with_context(|| format!("cannot read {}", dir.display()))? {
-        let name = entry?.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".xcworkspace") {
-            workspaces.push(name);
-        } else if name.ends_with(".xcodeproj") {
-            projects.push(name);
-        }
-    }
-    workspaces.sort();
-    projects.sort();
-    let pick = |mut v: Vec<String>, kind: &str| -> Result<String> {
-        match v.len() {
-            1 => Ok(v.remove(0)),
-            _ => bail!(
-                "multiple {kind} files found ({}) — pass --workspace",
-                v.join(", ")
-            ),
-        }
-    };
-    if !workspaces.is_empty() {
-        return pick(workspaces, ".xcworkspace");
-    }
-    if !projects.is_empty() {
-        return pick(projects, ".xcodeproj");
-    }
-    bail!(
-        "no .xcworkspace/.xcodeproj found in {} — pass --workspace (it may not be generated yet)",
-        dir.display()
-    )
+    let container = project::container_for_cli(dir)?;
+    Ok(container.relative.to_string_lossy().into_owned())
 }
 
 /// `xcodebuild -list -json` -> the project's schemes; unambiguous or bail.
@@ -309,13 +284,8 @@ fn existing_derived_data(dir: &Path) -> Option<String> {
 fn makefile_preflight(dir: &Path) -> Option<String> {
     let text = fs::read_to_string(dir.join("Makefile")).ok()?;
     text.lines()
-        // A `project:` rule, not a `project:=` / `project::=` variable
-        // assignment (which defines no target — the preflight would then
-        // fail with "No rule to make target 'project'").
-        .any(|l| {
-            l.strip_prefix("project:")
-                .is_some_and(|rest| !rest.starts_with('=') && !rest.starts_with(":="))
-        })
+        // The same rule test as project discovery's Make generator.
+        .any(project::is_project_rule)
         .then(|| "make project CI=true".to_owned())
 }
 
@@ -1155,11 +1125,27 @@ mod tests {
     #[test]
     fn find_workspace_prefers_xcworkspace_and_detects_ambiguity() {
         let dir = sandbox();
+        assert!(find_workspace(&dir)
+            .unwrap_err()
+            .to_string()
+            .starts_with(&format!("No Xcode project in {}: ", dir.display())));
         fs::create_dir(dir.join("app.xcodeproj")).unwrap();
         assert_eq!(find_workspace(&dir).unwrap(), "app.xcodeproj");
         fs::create_dir(dir.join("app.xcworkspace")).unwrap();
         assert_eq!(find_workspace(&dir).unwrap(), "app.xcworkspace");
         fs::create_dir(dir.join("other.xcworkspace")).unwrap();
-        assert!(find_workspace(&dir).is_err());
+        assert_eq!(
+            find_workspace(&dir).unwrap_err().to_string(),
+            "Found 2 Xcode workspaces: app.xcworkspace, other.xcworkspace. Pass --workspace \
+             to choose one."
+        );
+    }
+
+    #[test]
+    fn find_workspace_returns_a_nested_container_relative_to_the_root() {
+        let dir = sandbox();
+        fs::create_dir_all(dir.join("ios/MyApp.xcworkspace")).unwrap();
+        fs::create_dir_all(dir.join("ios/MyApp.xcodeproj")).unwrap();
+        assert_eq!(find_workspace(&dir).unwrap(), "ios/MyApp.xcworkspace");
     }
 }

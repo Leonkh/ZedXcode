@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::bail;
 
 use crate::engine::pipeline::zedxcode_home;
+use crate::engine::project;
 use crate::setup::project::{build_server_opted_in, find_in_path};
 use crate::setup::task_collisions;
 use crate::util::paths::{mtime, workspace_mtime};
@@ -368,7 +369,7 @@ fn zed_dap_binary_override(settings: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// In a project dir (has *.xcworkspace / *.xcodeproj / .zed): check
+/// In a project dir (an Xcode container per [`find_container`], or .zed): check
 /// buildServer.json presence, freshness relative to the workspace, its
 /// recorded build_root (DerivedData) and scheme.
 fn check_project(d: &mut Doctor) {
@@ -737,28 +738,32 @@ fn is_executable(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
-/// The build container the freshness check compares against: the first
-/// `.xcworkspace` in sort order, else the first `.xcodeproj`. Workspaces
-/// win regardless of name order (matching `find_workspace` in
-/// `setup/project.rs` and `commands/select.rs`) — buildServer.json is
-/// generated from the workspace when one exists.
+/// The build container the freshness check compares against: what
+/// [`project::discover`] finds within two levels of `dir`.
+/// - A container below `dir` counts only when `dir` is a project root (it
+///   holds `.zed/` or buildServer.json, or is the git toplevel): a folder
+///   that holds several checkouts is not one project.
+/// - A tie in `dir` itself counts as it always did: the first of them in
+///   path order (in one directory, a workspace before a project, since
+///   buildServer.json is generated from the workspace when one exists). A
+///   deeper tie is no answer, and the freshness check is skipped.
 fn find_container(dir: &Path) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .map(|x| x == "xcworkspace" || x == "xcodeproj")
-                .unwrap_or(false)
-        })
-        .collect();
-    candidates.sort();
-    candidates
-        .iter()
-        .find(|p| p.extension().is_some_and(|x| x == "xcworkspace"))
-        .cloned()
-        .or_else(|| candidates.into_iter().next())
+    let in_dir = |c: &project::Container| c.relative.parent() == Some(Path::new(""));
+    let found = match project::discover(dir) {
+        Ok(found) => found,
+        Err(tie) => {
+            let first = tie.tied.into_iter().next()?;
+            return in_dir(&first).then_some(first.path);
+        }
+    };
+    let container = found.container?;
+    let project_root = dir.join(".zed").is_dir()
+        || dir.join("buildServer.json").is_file()
+        || found
+            .git
+            .toplevel
+            .is_some_and(|t| dir.canonicalize().is_ok_and(|d| d == t));
+    (in_dir(&container) || project_root).then_some(container.path)
 }
 
 /// Stale pidfiles under `~/.zedxcode/run` (owner process no longer alive).
@@ -912,6 +917,47 @@ mod tests {
         let other = sandbox();
         fs::create_dir(other.join("Package.swift")).unwrap();
         assert!(!missing_build_server_is_failure(&other, true));
+    }
+
+    #[test]
+    fn find_container_takes_a_nested_container_only_in_a_project_root() {
+        let dir = sandbox();
+        assert_eq!(find_container(&dir), None);
+        fs::create_dir_all(dir.join("ios/MyApp.xcworkspace")).unwrap();
+        fs::create_dir_all(dir.join("ios/MyApp.xcodeproj")).unwrap();
+        // An unmarked folder (no .zed/, buildServer.json or git) may just
+        // hold checkouts: not a project ...
+        assert_eq!(find_container(&dir), None);
+        // ... but the git toplevel is.
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success());
+        assert_eq!(
+            find_container(&dir),
+            Some(dir.join("ios/MyApp.xcworkspace"))
+        );
+        // So is a folder with .zed/ in it.
+        let zed = sandbox();
+        fs::create_dir_all(zed.join("ios/MyApp.xcodeproj")).unwrap();
+        fs::create_dir(zed.join(".zed")).unwrap();
+        assert_eq!(find_container(&zed), Some(zed.join("ios/MyApp.xcodeproj")));
+        // A deeper tie is no answer, even there: no silent pick.
+        fs::create_dir_all(zed.join("demo/Demo.xcodeproj")).unwrap();
+        assert_eq!(find_container(&zed), None);
+        // A container in the folder itself always counts, a tie there too
+        // (the first in path order), as before.
+        let root = sandbox();
+        fs::create_dir(root.join("MyApp.xcworkspace")).unwrap();
+        assert_eq!(find_container(&root), Some(root.join("MyApp.xcworkspace")));
+        fs::create_dir(root.join("Other.xcworkspace")).unwrap();
+        assert_eq!(find_container(&root), Some(root.join("MyApp.xcworkspace")));
     }
 
     #[test]

@@ -20,6 +20,7 @@ use tokio::process::Command;
 
 use super::refresh;
 use crate::engine::pipeline::zedxcode_home;
+use crate::engine::project;
 use crate::engine::selection;
 use crate::setup::build_server::{regenerate, Regen};
 use crate::setup::jsonc;
@@ -33,7 +34,7 @@ use crate::util::paths::container_flag;
 
 #[derive(clap::Args, Debug)]
 pub struct SelectSchemeArgs {
-    /// Path to .xcworkspace / .xcodeproj (default: auto-detect in the project root)
+    /// Path to .xcworkspace / .xcodeproj (default: auto-detect within two levels of the project root)
     #[arg(long, short = 'w')]
     pub workspace: Option<PathBuf>,
     /// Set the scheme non-interactively (exact name, case-insensitive)
@@ -125,9 +126,10 @@ pub async fn run_select_scheme(args: SelectSchemeArgs) -> Result<()> {
     // Same opt-in gate as the build pipeline's auto-regen: never
     // first-create the file in a repo that never configured the Xcode
     // adapter, and git-ignore it when a first-create does happen (setup's
-    // .git/info/exclude step never ran there).
-    let ws_dir = workspace.parent().unwrap_or(&project);
-    let build_server = ws_dir.join("buildServer.json");
+    // .git/info/exclude step never ran there). The file lives in the project
+    // root, where setup and refresh write it and sourcekit-lsp reads it, also
+    // when the container sits in a subfolder (`ios/MyApp.xcworkspace`).
+    let build_server = project.join("buildServer.json");
     if build_server_opted_in(&project, &build_server) {
         // Expand $ZED_WORKTREE_ROOT and anchor relative values to `project`
         // (not the cwd — select-scheme can run from a subdirectory), the same
@@ -136,9 +138,9 @@ pub async fn run_select_scheme(args: SelectSchemeArgs) -> Result<()> {
         let derived_data = debug_json_str(&project, "derivedData")
             .map(|d| refresh::expand_worktree_root(&d, &project));
         let dd = derived_data.as_deref();
-        if let Regen::Written(outcome) = regenerate(ws_dir, &workspace, &chosen, None, dd).await {
+        if let Regen::Written(outcome) = regenerate(&project, &workspace, &chosen, None, dd).await {
             if outcome.first_create() {
-                git_exclude_build_server(ws_dir);
+                git_exclude_build_server(&project);
             }
             // A scheme-only change needs no restart: bsp reloads
             // buildServer.json on the mtime change and pushes
@@ -262,46 +264,11 @@ fn project_dir() -> Result<PathBuf> {
     })
 }
 
-/// The single top-level `*.xcworkspace` (preferred) or `*.xcodeproj`.
+/// The container [`project::discover`] finds within two levels of the
+/// project root (absolute). A tie or no container points at `--workspace`,
+/// which skips this search.
 fn find_workspace(project: &Path) -> Result<PathBuf> {
-    let mut workspaces = vec![];
-    let mut projects = vec![];
-    for entry in
-        std::fs::read_dir(project).with_context(|| format!("cannot read {}", project.display()))?
-    {
-        let name = entry?.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".xcworkspace") {
-            workspaces.push(name);
-        } else if name.ends_with(".xcodeproj") {
-            projects.push(name);
-        }
-    }
-    workspaces.sort();
-    projects.sort();
-    let found = match (workspaces.len(), projects.len()) {
-        (1, _) => workspaces.remove(0),
-        (0, 1) => projects.remove(0),
-        (0, 0) => bail!(
-            "no .xcworkspace/.xcodeproj found in {} — generate the project \
-             first (e.g. `make project CI=true`) or pass --workspace",
-            project.display()
-        ),
-        _ => {
-            // Ambiguous: several workspaces, or no workspace but several
-            // projects — report whichever set the user has to pick from.
-            let (kind, names) = if workspaces.is_empty() {
-                (".xcodeproj", &projects)
-            } else {
-                (".xcworkspace", &workspaces)
-            };
-            bail!(
-                "multiple {kind} files found in {} ({}) — pass --workspace",
-                project.display(),
-                names.join(", ")
-            )
-        }
-    };
-    Ok(project.join(found))
+    Ok(project::container_for_cli(project)?.path)
 }
 
 /// Current scheme for the "(current)" marker: the overlay's scheme, else the
@@ -676,6 +643,23 @@ mod tests {
                 current: false,
             })
             .collect()
+    }
+
+    #[test]
+    fn find_workspace_searches_two_levels_and_names_a_tie() {
+        let dir = sandbox();
+        fs::create_dir_all(dir.join("ios/MyApp.xcworkspace")).unwrap();
+        fs::create_dir_all(dir.join("ios/MyApp.xcodeproj")).unwrap();
+        assert_eq!(
+            find_workspace(&dir).unwrap(),
+            dir.join("ios/MyApp.xcworkspace")
+        );
+        fs::create_dir_all(dir.join("watch/Watch.xcodeproj")).unwrap();
+        assert_eq!(
+            find_workspace(&dir).unwrap_err().to_string(),
+            "Found 2 Xcode workspaces and projects: ios/MyApp.xcworkspace, \
+             watch/Watch.xcodeproj. Pass --workspace to choose one."
+        );
     }
 
     #[test]

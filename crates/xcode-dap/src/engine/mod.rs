@@ -10,6 +10,7 @@ pub mod compile_store;
 pub mod config;
 pub mod consoles;
 pub mod pipeline;
+pub mod project;
 pub mod selection;
 pub mod simctl;
 pub mod xcactivitylog;

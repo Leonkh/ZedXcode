@@ -44,6 +44,7 @@ ZedXcode/
 │       ├── engine/
 │       │   ├── config.rs           # LaunchConfig re-export (schema lives in crates/xcode-dap-config)
 │       │   ├── pipeline.rs         # preflight→buildServer→build→install→launch→pid→ingest (shared by dap + CLI)
+│       │   ├── project.rs          # project root, container and generator discovery (two levels deep), git worktree info
 │       │   ├── xcodebuild.rs       # build/clean/showBuildSettings, output filter/throttle
 │       │   ├── simctl.rs           # device resolution, boot, install, launch, terminate, pid fallback
 │       │   ├── consoles.rs         # stdout/stderr file tailers, optional oslog pump
