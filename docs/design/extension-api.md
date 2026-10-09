@@ -158,7 +158,7 @@ const PROXY_TAG:  &str = "xcode-dap-v0.1.0";   // bumped in lockstep with extens
 fn cached_or_downloaded_proxy(&mut self) -> Result<String, String> {
     let arch = match zed::current_platform() {
         (zed::Os::Mac, zed::Architecture::Aarch64) => "aarch64",
-        (zed::Os::Mac, zed::Architecture::X8664)   => "x86_64",
+        (zed::Os::Mac, zed::Architecture::X8664)   => return Err("Xcode Tools supports Apple silicon Macs only; this Mac is Intel (x86_64).".into()),
         _ => return Err("the Xcode adapter is macOS-only".into()),
     };
     let version_dir = format!("xcode-dap/{PROXY_TAG}");            // relative to work dir

@@ -16,7 +16,7 @@ use zed_extension_api::{
     StartDebuggingRequestArgumentsRequest, Worktree,
 };
 
-/// GitHub repo hosting `xcode-dap-v*` releases (per-arch tar.gz assets).
+/// GitHub repo hosting `xcode-dap-v*` releases (one Apple silicon tar.gz asset each).
 const PROXY_REPO: &str = "Leonkh/ZedXcode";
 /// Pinned release tag; bumped in lockstep with the extension version.
 const PROXY_TAG: &str = "xcode-dap-v0.1.0";
@@ -63,9 +63,18 @@ impl XcodeToolsExtension {
     /// `xcode-dap-v0.1.0-aarch64-apple-darwin.tar.gz`, containing a single
     /// `xcode-dap` binary at the archive root.
     fn cached_or_downloaded_proxy(&mut self) -> Result<(String, &'static str), String> {
+        // Releases ship an Apple silicon binary only, so an Intel Mac gets a
+        // clear answer here instead of a missing-asset error below. Zed
+        // reports the architecture it was built for, so the Intel build of
+        // Zed running under Rosetta on an Apple silicon Mac also lands here.
         let arch = match current_platform() {
             (Os::Mac, Architecture::Aarch64) => "aarch64",
-            (Os::Mac, Architecture::X8664) => "x86_64",
+            (Os::Mac, Architecture::X8664) => {
+                return Err(
+                    "Xcode Tools supports Apple silicon Macs only; this Mac is Intel (x86_64)."
+                        .to_string(),
+                );
+            }
             _ => return Err("the Xcode debug adapter is macOS-only".to_string()),
         };
 
@@ -180,21 +189,24 @@ impl zed::Extension for XcodeToolsExtension {
             return Err(format!("unexpected debug adapter name: {adapter_name}"));
         }
 
-        // Sanity check only — full validation belongs to the proxy, which
-        // parses the very same shared struct (crates/xcode-dap-config).
-        serde_json::from_str::<xcode_dap_config::LaunchConfig>(&config.config).map_err(|err| {
-            format!(
-                "invalid Xcode scenario config: {err}. See the Xcode.json schema \
-                 (required: \"workspace\", \"scheme\"; e.g. \
-                 {{\"workspace\": \"$ZED_WORKTREE_ROOT/App.xcworkspace\", \"scheme\": \"App\", \
-                 \"device\": \"iPhone 15 Pro Max\"}})"
-            )
-        })?;
-
+        // Resolve (and on first use download) the binary before looking at
+        // the scenario: a newcomer whose scenario is still incomplete then
+        // has the binary that `setup --project` needs, and the error below
+        // can name it.
         let (command, source) =
             self.resolve_proxy_command(user_provided_debug_adapter_path, worktree)?;
         // Visible under `zed --foreground`.
         println!("xcode-tools: xcode-dap resolved from {source}: {command}");
+
+        // Sanity check only — full validation belongs to the proxy, which
+        // parses the very same shared struct (crates/xcode-dap-config).
+        serde_json::from_str::<xcode_dap_config::LaunchConfig>(&config.config).map_err(|err| {
+            format!(
+                "Xcode Tools installed xcode-dap at {command}, but this scenario is incomplete: \
+                 {err}. Add \"workspace\" and \"scheme\" to it in .zed/debug.json, or run \
+                 \"{command}\" setup --project . in a terminal at the project root."
+            )
+        })?;
 
         // User's shell env → DEVELOPER_DIR, PATH for xcrun/tuist/make.
         let mut envs = worktree.shell_env();
