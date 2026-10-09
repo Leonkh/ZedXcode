@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::engine::destinations::{self, Device};
 use crate::engine::project::{self, Project};
-use crate::engine::selection::{self, Options, Request};
+use crate::engine::schemes::SchemeList;
+use crate::engine::selection::{self, Options, Picks, Request, Sourced};
 use crate::engine::xcodebuild::Target;
 use crate::engine::{compile_store, schemes, simctl, xcactivitylog, xcodebuild};
 use crate::setup::build_server::{write_build_server_json, Change};
@@ -113,16 +114,7 @@ pub async fn prepare(
         }
         Err(e) => return Err(e),
     };
-    let (scheme, configuration) = match &list {
-        Some(list) => (
-            selection::settle_scheme(picks.scheme.as_ref(), list, &container)?,
-            selection::settle_configuration(picks.configuration.as_ref(), list, &container)?,
-        ),
-        None => (
-            picks.scheme.clone().expect("checked above"),
-            picks.configuration.clone(),
-        ),
-    };
+    let settled = settle_target(&req.options, picks, container, list.as_ref())?;
 
     // `simctl list` hangs while CoreSimulatorService restarts; a Stop must
     // not wait for it.
@@ -139,18 +131,63 @@ pub async fn prepare(
         None
     };
 
-    let summary = selection::summary(&scheme, device.as_ref(), configuration.as_ref());
+    let summary = selection::summary(
+        &settled.scheme,
+        device.as_ref(),
+        settled.configuration.as_ref(),
+    );
     log::info!(target: "pipeline", "{summary}");
     sink.line("console", &summary);
     Ok(Prepared {
+        target: settled.target,
+        device: device.map(|d| d.value),
+    })
+}
+
+/// The scheme and configuration settled against the container, and the
+/// target they make.
+#[derive(Debug)]
+pub struct Settled {
+    pub target: Target,
+    pub scheme: Sourced<String>,
+    pub configuration: Option<Sourced<String>>,
+}
+
+/// Settle the picked scheme and configuration against `list`, the
+/// container's scheme list (see [`selection::settle_scheme`] and
+/// [`selection::settle_configuration`]), and make the target xcodebuild
+/// works on. Without a list (it could not be read) a chosen scheme and
+/// configuration are taken unchecked; with nothing chosen there is nothing
+/// to build.
+pub fn settle_target(
+    options: &Options,
+    picks: &Picks,
+    container: PathBuf,
+    list: Option<&SchemeList>,
+) -> anyhow::Result<Settled> {
+    let (scheme, configuration) = match list {
+        Some(list) => (
+            selection::settle_scheme(picks.scheme.as_ref(), list, &container)?,
+            selection::settle_configuration(picks.configuration.as_ref(), list, &container)?,
+        ),
+        None => (
+            picks
+                .scheme
+                .clone()
+                .context("no scheme chosen, and the scheme list could not be read")?,
+            picks.configuration.clone(),
+        ),
+    };
+    Ok(Settled {
         target: Target {
             workspace: container,
-            scheme: scheme.value,
-            configuration: configuration.map(|c| c.value),
-            derived_data: req.options.derived_data.clone(),
-            build_output: req.options.build_output,
+            scheme: scheme.value.clone(),
+            configuration: configuration.as_ref().map(|c| c.value.clone()),
+            derived_data: options.derived_data.clone(),
+            build_output: options.build_output,
         },
-        device: device.map(|d| d.value),
+        scheme,
+        configuration,
     })
 }
 

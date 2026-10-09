@@ -372,6 +372,120 @@ fn task_entry(label: &str, command: &str, args: &[String]) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// 0.1 tasks
+// ---------------------------------------------------------------------------
+
+/// The labels of the six tasks 0.1's `setup --project` wrote into
+/// `.zed/tasks.json` ([`render_tasks_json`]).
+pub const LEGACY_TASK_LABELS: [&str; 6] = [
+    "Xcode: Build",
+    "Xcode: Clean",
+    "Xcode: Refresh",
+    "Xcode: Console",
+    "Xcode: Choose Scheme",
+    "Xcode: Choose Destination",
+];
+
+/// The label of the 0.1 task whose command line this is, if any: an entry
+/// of `<root>/.zed/tasks.json` labelled with one of [`LEGACY_TASK_LABELS`],
+/// whose command is an xcode-dap binary and whose args are `args` (this
+/// command line without the program). Each arg is compared as it reaches
+/// xcode-dap — Zed fills in `$ZED_WORKTREE_ROOT` (with any path to `root`),
+/// the shell removes setup's quotes — or as the file writes it. A missing or
+/// unreadable file matches nothing.
+pub fn legacy_task_invocation(root: &Path, args: &[String]) -> Option<&'static str> {
+    use crate::setup::task_collisions::{is_xcode_dap_command, TasksFormat};
+
+    let text = fs::read_to_string(root.join(".zed").join("tasks.json")).ok()?;
+    let tasks = jsonc::parse_jsonc(&text).ok()?;
+    tasks.as_array()?.iter().find_map(|task| {
+        let label = task.get("label").and_then(|l| l.as_str())?;
+        let label = LEGACY_TASK_LABELS.iter().find(|l| **l == label)?;
+        let command = task.get("command").and_then(|c| c.as_str())?;
+        if !is_xcode_dap_command(command, TasksFormat::Zed, None) {
+            return None;
+        }
+        let written = task.get("args").and_then(|a| a.as_array())?;
+        let same = written.len() == args.len()
+            && written
+                .iter()
+                .zip(args)
+                .all(|(w, a)| w.as_str().is_some_and(|w| task_arg_is(w, a, root)));
+        same.then_some(*label)
+    })
+}
+
+/// Does the task arg `written` reach xcode-dap as `actual`? Zed fills in
+/// `$ZED_WORKTREE_ROOT` with the worktree path as it opened it, which may
+/// reach `root` through a symlink, so that part of the arg matches any path
+/// to the same folder.
+fn task_arg_is(written: &str, actual: &str, root: &Path) -> bool {
+    if written == actual {
+        return true;
+    }
+    // No argument can hold a NUL: it marks where Zed puts the root.
+    const ROOT: char = '\0';
+    let marked = written
+        .replace("${ZED_WORKTREE_ROOT}", "\0")
+        .replace("$ZED_WORKTREE_ROOT", "\0");
+    let Some(word) = shell_unquote(&marked) else {
+        return false;
+    };
+    let Some((before, after)) = word.split_once(ROOT) else {
+        return word == actual;
+    };
+    if after.contains(ROOT) {
+        // The root more than once: only its own spelling matches.
+        return word.replace(ROOT, &root.to_string_lossy()) == actual;
+    }
+    actual
+        .strip_prefix(before)
+        .and_then(|rest| rest.strip_suffix(after))
+        .is_some_and(|path| same_folder(Path::new(path), root))
+}
+
+/// Are `a` and `b` the same folder, also when one is reached through a
+/// symlink?
+fn same_folder(a: &Path, b: &Path) -> bool {
+    a == b || matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+}
+
+/// The word a POSIX shell makes of `s`: single-quoted runs taken literally,
+/// double-quoted runs and the rest with their backslash escapes resolved
+/// (the inverse of [`shell_quote`], and of a hand-written `"…"`). `None`
+/// when a quote is not closed or a backslash ends the text.
+fn shell_unquote(s: &str) -> Option<String> {
+    let mut word = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => loop {
+                match chars.next()? {
+                    '\'' => break,
+                    c => word.push(c),
+                }
+            },
+            '"' => loop {
+                match chars.next()? {
+                    '"' => break,
+                    '\\' => {
+                        let escaped = chars.next()?;
+                        if !matches!(escaped, '"' | '\\' | '$' | '`') {
+                            word.push('\\');
+                        }
+                        word.push(escaped);
+                    }
+                    c => word.push(c),
+                }
+            },
+            '\\' => word.push(chars.next()?),
+            c => word.push(c),
+        }
+    }
+    Some(word)
+}
+
 /// Write `.zed/debug.json` + `.zed/tasks.json` (backup-then-rewrite when an
 /// existing file differs; no-op when identical). `xcode_dap` is the task
 /// command path (see [`render_tasks_json`]).
@@ -866,6 +980,198 @@ mod tests {
             // absolute path, never a bare `xcode-dap` (exit-127 prevention)
             assert_eq!(t["command"], XCODE_DAP_BIN);
             assert_eq!(t["cwd"], "$ZED_WORKTREE_ROOT");
+        }
+    }
+
+    /// The `.zed` files 0.1's `setup --project` wrote, kept as they were
+    /// (the xcworkspace layout fixture; scheme, device and the command path
+    /// need setup's quotes): what an unmigrated project still has.
+    const V0_1_TASKS_JSON: &str = include_str!("../../../../tests/fixtures/setup-0.1/tasks.json");
+    const V0_1_DEBUG_JSON: &str = include_str!("../../../../tests/fixtures/setup-0.1/debug.json");
+
+    #[test]
+    fn legacy_task_labels_are_the_ones_setup_wrote() {
+        let v = jsonc::parse_jsonc(V0_1_TASKS_JSON).unwrap();
+        let labels: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(labels, LEGACY_TASK_LABELS);
+        // Setup still writes 0.1's files byte for byte. Once it stops
+        // writing project tasks, this comparison goes; the fixture stays.
+        let cfg = ProjectConfig {
+            workspace: "MyApp.xcworkspace".into(),
+            scheme: "MyApp Dev".into(),
+            device: "iPhone 15 Pro".into(),
+            os: Some("17.5".into()),
+            preflight: None,
+            oslog: false,
+            derived_data: None,
+        };
+        assert_eq!(
+            render_tasks_json(&cfg, "/Users/Jane/My Tools/xcode-dap"),
+            V0_1_TASKS_JSON
+        );
+        assert_eq!(render_debug_json(&cfg), V0_1_DEBUG_JSON);
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// A project folder with 0.1's `.zed/tasks.json`.
+    fn v0_1_project() -> PathBuf {
+        let dir = sandbox();
+        fs::create_dir_all(dir.join(".zed")).unwrap();
+        fs::write(dir.join(".zed/tasks.json"), V0_1_TASKS_JSON).unwrap();
+        dir
+    }
+
+    #[test]
+    fn legacy_tasks_are_recognised_by_their_command_line() {
+        let dir = sandbox();
+        assert_eq!(legacy_task_invocation(&dir, &args(&["build"])), None);
+        let dir = v0_1_project();
+        // As the shell hands the args over: setup's quotes removed.
+        let build = [
+            "build",
+            "--workspace",
+            "MyApp.xcworkspace",
+            "--scheme",
+            "MyApp Dev",
+            "--device",
+            "iPhone 15 Pro",
+            "--os",
+            "17.5",
+        ];
+        assert_eq!(
+            legacy_task_invocation(&dir, &args(&build)),
+            Some("Xcode: Build")
+        );
+        let clean = [
+            "clean",
+            "--workspace",
+            "MyApp.xcworkspace",
+            "--scheme",
+            "MyApp Dev",
+        ];
+        assert_eq!(
+            legacy_task_invocation(&dir, &args(&clean)),
+            Some("Xcode: Clean")
+        );
+        assert_eq!(
+            legacy_task_invocation(
+                &dir,
+                &args(&["select-scheme", "--workspace", "MyApp.xcworkspace"])
+            ),
+            Some("Xcode: Choose Scheme")
+        );
+        // Literally as the file writes them (quotes kept) also matches.
+        let mut quoted = build;
+        quoted[4] = "'MyApp Dev'";
+        assert_eq!(
+            legacy_task_invocation(&dir, &args(&quoted)),
+            Some("Xcode: Build")
+        );
+        // Any other command line is not a 0.1 task.
+        for other in [
+            &build[..8],
+            &["build", "-w", "MyApp.xcworkspace", "-s", "MyApp Dev"][..],
+            &["build", "--scheme", "MyApp Dev"][..],
+            &["build"][..],
+            &["run"][..],
+        ] {
+            assert_eq!(
+                legacy_task_invocation(&dir, &args(other)),
+                None,
+                "{other:?}"
+            );
+        }
+        let mut changed = build;
+        changed[4] = "MyApp";
+        assert_eq!(legacy_task_invocation(&dir, &args(&changed)), None);
+    }
+
+    #[test]
+    fn legacy_tasks_need_a_0_1_label_and_an_xcode_dap_command() {
+        let dir = sandbox();
+        fs::create_dir_all(dir.join(".zed")).unwrap();
+        let tasks = |label: &str, command: &str, args: serde_json::Value| {
+            fs::write(
+                dir.join(".zed/tasks.json"),
+                serde_json::json!([{ "label": label, "command": command, "args": args,
+                                     "cwd": "$ZED_WORKTREE_ROOT" }])
+                .to_string(),
+            )
+            .unwrap();
+        };
+        let build = serde_json::json!(["build", "--scheme", "MyApp"]);
+        tasks("Xcode: Build", "xcode-dap", build.clone());
+        assert_eq!(
+            legacy_task_invocation(&dir, &args(&["build", "--scheme", "MyApp"])),
+            Some("Xcode: Build")
+        );
+        tasks("Xcode: Build", "./xcode-dap", build.clone());
+        assert_eq!(
+            legacy_task_invocation(&dir, &args(&["build", "--scheme", "MyApp"])),
+            None
+        );
+        tasks("Xcode: Run", "xcode-dap", build.clone());
+        assert_eq!(
+            legacy_task_invocation(&dir, &args(&["build", "--scheme", "MyApp"])),
+            None
+        );
+        // Zed fills in $ZED_WORKTREE_ROOT before the shell reads the args.
+        tasks(
+            "Xcode: Build",
+            "/opt/homebrew/bin/xcode-dap",
+            serde_json::json!(["build", "--derived-data", "'$ZED_WORKTREE_ROOT/.build/dd'"]),
+        );
+        let derived_data = format!("{}/.build/dd", dir.display());
+        assert_eq!(
+            legacy_task_invocation(&dir, &args(&["build", "--derived-data", &derived_data])),
+            Some("Xcode: Build")
+        );
+        // Zed fills it in with the path it opened, which may reach the
+        // root through a symlink; a path to another folder does not match.
+        let link = sandbox().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let through_link = format!("{}/.build/dd", link.display());
+        assert_eq!(
+            legacy_task_invocation(&dir, &args(&["build", "--derived-data", &through_link])),
+            Some("Xcode: Build")
+        );
+        let elsewhere = format!("{}/.build/dd", sandbox().display());
+        assert_eq!(
+            legacy_task_invocation(&dir, &args(&["build", "--derived-data", &elsewhere])),
+            None
+        );
+        // A file that does not parse matches nothing.
+        fs::write(dir.join(".zed/tasks.json"), "[{").unwrap();
+        assert_eq!(legacy_task_invocation(&dir, &args(&["build"])), None);
+    }
+
+    #[test]
+    fn shell_unquote_reads_words_as_the_shell_does() {
+        for (written, word) in [
+            ("MyApp", "MyApp"),
+            ("'MyApp (staging)'", "MyApp (staging)"),
+            (r"'O'\''Brien'", "O'Brien"),
+            (r#""MyApp \"Dev\"""#, r#"MyApp "Dev""#),
+            (r#""a\b""#, r"a\b"),
+            (r"iPhone\ 16e", "iPhone 16e"),
+            ("''", ""),
+        ] {
+            assert_eq!(shell_unquote(written).as_deref(), Some(word), "{written}");
+        }
+        // The inverse of setup's quoting.
+        for word in ["MyApp", "MyApp (staging)", "O'Brien", "$HOME", ""] {
+            assert_eq!(shell_unquote(&shell_quote(word)).as_deref(), Some(word));
+        }
+        for broken in ["'open", "\"open", "trailing\\"] {
+            assert_eq!(shell_unquote(broken), None, "{broken}");
         }
     }
 

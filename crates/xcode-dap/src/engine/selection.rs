@@ -41,9 +41,12 @@
 //! Layers 1 to 4 need only files ([`pick`]); automatic values and the
 //! validation of all three need the container and the simulators, after any
 //! generating preflight ([`settle_scheme`], [`settle_configuration`],
-//! [`settle_destination`]). The command line's flags still rank below the
-//! stores, as 0.1's overlay ranked them below the store
-//! ([`FlagRank::BelowStore`]).
+//! [`settle_destination`]).
+//!
+//! One exception keeps 0.1 projects working as they did: when the command
+//! line is one of the tasks 0.1's setup wrote into `.zed/tasks.json`, its
+//! baked flags rank below the stores, as 0.1's overlay ranked them below the
+//! store ([`FlagRank::BelowStore`]), and one line says how to migrate.
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -463,7 +466,8 @@ impl Source {
     pub fn label(self, field: Field) -> &'static str {
         match (self, field) {
             (Source::Flag, Field::Scheme) => "--scheme",
-            (Source::Flag, Field::Destination) => "--device",
+            // 0.1's tasks pass `--device`, the other spelling of the flag.
+            (Source::Flag, Field::Destination) => "--destination/--device",
             (Source::Flag, Field::Configuration) => "--configuration",
             (Source::Store, _) => STORE_LABEL,
             (Source::MainCheckout, _) => "the main checkout's .zed/.zedx/selection.json",
@@ -548,9 +552,10 @@ pub enum FlagRank {
     /// Above everything: a one-off override.
     #[default]
     First,
-    /// Below the project's store, as the 0.1 overlay ranked them, and below
-    /// the main checkout's store too, so that in a linked worktree ⌘B with
-    /// 0.1's baked flags builds what ⌘R builds from the inherited store.
+    /// For a 0.1 task's baked flags: below the project's store, as the 0.1
+    /// overlay ranked them, and below the main checkout's store too, so that
+    /// in a linked worktree ⌘B with 0.1's baked flags builds what ⌘R builds
+    /// from the inherited store.
     BelowStore,
 }
 
@@ -676,13 +681,29 @@ pub struct CliFlags {
     /// Absolute.
     pub workspace: Option<PathBuf>,
     pub scheme: Option<String>,
-    pub device: Option<String>,
+    /// `--destination` (0.1's `--device`): a UDID, a simulator name, or
+    /// `booted`.
+    pub destination: Option<String>,
     pub os: Option<String>,
     pub configuration: Option<String>,
     pub derived_data: Option<PathBuf>,
     pub full_output: bool,
     pub oslog: bool,
     pub oslog_predicate: Option<String>,
+    /// The label of the 0.1 task this command line is (see
+    /// [`crate::setup::project::legacy_task_invocation`]): its flags then
+    /// rank below the stores.
+    pub legacy_task: Option<&'static str>,
+}
+
+/// The one line a 0.1 task prints: why the stores outrank its flags, and
+/// how to leave the 0.1 setup behind.
+pub fn legacy_task_line(label: &str) -> String {
+    format!(
+        "\"{label}\" is a task of the 0.1 setup (.zed/tasks.json): the scheme, destination \
+         and configuration chosen for this project outrank its flags. Run Xcode: Set Up \
+         Project (or \"xcode-dap setup\") once to migrate."
+    )
 }
 
 impl Request {
@@ -705,11 +726,19 @@ impl Request {
         }
     }
 
-    /// A command typed in a terminal or run by a task: its flags, then the
-    /// project's first Xcode scenario for the deprecated keys and for the
-    /// options the flags leave open, then the defaults.
+    /// A command typed in a terminal or run by a task: its flags (a one-off
+    /// override, or for a 0.1 task below the stores), then the project's
+    /// first Xcode scenario for the deprecated keys and for the options the
+    /// flags leave open, then the defaults.
     pub fn for_cli(root: PathBuf, flags: CliFlags) -> Request {
         let mut warnings = Vec::new();
+        let flag_rank = match flags.legacy_task {
+            Some(label) => {
+                warnings.push(legacy_task_line(label));
+                FlagRank::BelowStore
+            }
+            None => FlagRank::First,
+        };
         // The global `Xcode: Run` scenario, once setup writes one, is the
         // next place to look when the project has none.
         let scenario = first_xcode_scenario(&root).unwrap_or_else(|warning| {
@@ -729,12 +758,11 @@ impl Request {
                 .or_else(|| scenario.and_then(|s| s.workspace.as_deref()).map(expand)),
             flags: Layer::legacy(
                 flags.scheme.as_deref(),
-                flags.device.as_deref(),
+                flags.destination.as_deref(),
                 flags.os.as_deref(),
                 flags.configuration.as_deref(),
             ),
-            // The flags 0.1's tasks bake in keep 0.1's rank for now.
-            flag_rank: FlagRank::BelowStore,
+            flag_rank,
             scenario: scenario.map(Layer::from_scenario).unwrap_or_default(),
             options: Options {
                 preflight: None,
@@ -1645,7 +1673,7 @@ mod tests {
             Layer::legacy(Some("MyApp"), Some("iPhone 17"), Some("26.0"), None)
         );
         assert_eq!(req.flags, Layer::default());
-        assert_eq!(req.flag_rank, FlagRank::BelowStore);
+        assert_eq!(req.flag_rank, FlagRank::First);
         assert_eq!(
             req.options,
             Options {
@@ -1684,6 +1712,74 @@ mod tests {
               invalid type: string \"yes\", expected a boolean."
             ]
         );
+    }
+
+    #[test]
+    fn cli_flags_override_once_and_are_never_saved() {
+        let root = sandbox();
+        fs::create_dir_all(root.join("MyApp.xcodeproj")).unwrap();
+        store_with(&root, Field::Scheme, 2);
+        store_with(&root, Field::Destination, 2);
+        let path = store_path(&root);
+        let before = fs::read(&path).unwrap();
+        let flags = CliFlags {
+            scheme: Some("Scheme1".into()),
+            destination: Some("iPhone 11".into()),
+            configuration: Some("Config1".into()),
+            ..Default::default()
+        };
+        let req = Request::for_cli(root.clone(), flags.clone());
+        assert_eq!(req.flag_rank, FlagRank::First);
+        assert!(req.warnings.is_empty());
+        let picks = resolve(&req).unwrap().picks;
+        for field in [Field::Scheme, Field::Destination, Field::Configuration] {
+            assert_eq!(
+                picked(&picks, field),
+                Some((value(field, 1), Source::Flag)),
+                "{field:?}"
+            );
+        }
+        assert_eq!(
+            Source::Flag.label(Field::Destination),
+            "--destination/--device",
+            "named in messages"
+        );
+        // Nothing was written, and without the flags the store answers again.
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let picks = resolve(&Request::for_cli(root.clone(), CliFlags::default()))
+            .unwrap()
+            .picks;
+        assert_eq!(
+            picked(&picks, Field::Scheme),
+            Some(("Scheme2".into(), Source::Store))
+        );
+
+        // A 0.1 task's flags rank below the store, with one line about it.
+        let req = Request::for_cli(
+            root.clone(),
+            CliFlags {
+                legacy_task: Some("Xcode: Build"),
+                ..flags
+            },
+        );
+        assert_eq!(req.flag_rank, FlagRank::BelowStore);
+        assert_eq!(req.warnings, [legacy_task_line("Xcode: Build")]);
+        let resolution = resolve(&req).unwrap();
+        assert_eq!(
+            picked(&resolution.picks, Field::Scheme),
+            Some(("Scheme2".into(), Source::Store))
+        );
+        assert_eq!(
+            picked(&resolution.picks, Field::Destination),
+            Some(("iPhone 12".into(), Source::Store))
+        );
+        // The store chose no configuration: the flag's applies.
+        assert_eq!(
+            picked(&resolution.picks, Field::Configuration),
+            Some(("Config1".into(), Source::Flag))
+        );
+        assert_eq!(resolution.picks.warnings, req.warnings);
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]

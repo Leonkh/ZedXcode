@@ -234,12 +234,13 @@ Zed task. Run `xcode-dap <command> --help` for flags.
 |---|---|
 | *(no subcommand)* | DAP proxy mode on stdio — how Zed spawns it |
 | `bsp` | Built-in Build Server mode on stdio — sourcekit-lsp spawns it via `buildServer.json` to answer per-file compile-args queries; not invoked by hand |
-| `build` | Build the scheme for the simulator (`-w` workspace, `-s` scheme, `--device`, `--os`, `--configuration`, `--derived-data`, `--full-output`); exit code = xcodebuild's |
-| `run` | Build, install and launch on the simulator **without** the debugger; console streams to the terminal |
-| `clean` | `xcodebuild clean` for the workspace/scheme (also accepts `--derived-data`) |
+| `build` | Build the chosen scheme for the simulator; exit code = xcodebuild's. Every flag is optional and applies to this command only, never saved: `-w` workspace, `-s` scheme, `--destination` (a UDID or name; 0.1's `--device` still works), `--os`, `--configuration`, `--derived-data`, `--full-output` |
+| `run` | Build, install and launch on the simulator **without** the debugger; console streams to the terminal (the same optional flags as `build`) |
+| `clean` | `xcodebuild clean` for the chosen scheme (optional, for this command only: `-w`, `-s`, `--configuration`, `--derived-data`) |
 | `console` | Print (or `-f` follow) the current run's app console logs from `~/.zedxcode/run/<udid>/` |
 | `select-scheme` | Pick the scheme interactively (or `--set`/`--list`); writes the `.zed/.zedx/selection.json` overlay used by the next run and regenerates `buildServer.json` for the new scheme |
-| `select-device` | Pick the simulator destination interactively (or `--set`/`--list`); same overlay |
+| `select-device` | Pick the simulator destination interactively (or `--set`/`--list`); same overlay. Also `select-destination` |
+| `select-configuration` | Pick the build configuration interactively (or `--set`/`--list`/`--reset`); same overlay |
 | `setup` | Install user-level keymap/settings marker blocks (`--user`) and per-project config (`--project <dir>`); `--remove` reverts the user blocks |
 | `refresh` | Re-run the preflight (project regeneration) and refresh `buildServer.json`; prints the LSP-restart hint |
 | `doctor` | Check the environment: Xcode, `lldb-dap`, simulators, sourcekit-lsp, `buildServer.json` (freshness, its recorded `build_root`/scheme, and that `argv` launches the built-in `bsp` server), the compile store, and stale state |

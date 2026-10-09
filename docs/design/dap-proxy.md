@@ -239,11 +239,11 @@ Verified: **no clear-console action exists** in Zed's debugger (console namespac
 | Command | Behavior |
 |---|---|
 | *(none)* | DAP proxy mode (with 2 s initialize guard) |
-| `build --workspace --scheme [--device] [--full-output]` | Pipeline phases 1–4 only; exit code = xcodebuild's. This is what `.zed/tasks.json` "Xcode: Build" (CMD+B) calls |
+| `build [--workspace] [--scheme] [--destination] [--os] [--configuration] [--full-output]` | Pipeline phases 1–4 only; exit code = xcodebuild's. This is what the "Xcode: Build" task (CMD+B) calls. Every flag is optional: the scheme, destination and configuration flags are layer 1 of `resolve()` for this invocation only and are never saved (`--device` is 0.1's spelling of `--destination`). A command line equal to one of the tasks 0.1's setup wrote into `<root>/.zed/tasks.json` (label, an xcode-dap command and the same args) keeps 0.1's order: its flags rank below both stores, and one line names the migration |
 | `run` | Phases 1–8 without debugger: launch *without* `--wait-for-debugger`, stream console to terminal |
 | `clean` | `xcodebuild -workspace … -scheme … clean` (CMD+Shift+K task) |
 | `console [-f/--follow]` | Print (or tail) the current run's app console logs from `~/.zedxcode/run/<udid>/{out,err}.log` |
-| `select-scheme` / `select-device` | Interactive pickers (or `--set`/`--list`) writing the selection store `.zed/.zedx/selection.json` that the next run reads; `select-scheme` also regenerates `buildServer.json` for the new scheme |
+| `select-scheme` / `select-device` (alias `select-destination`) / `select-configuration` | Interactive pickers (or `--set`/`--list`/`--reset`) writing the selection store `.zed/.zedx/selection.json` (version 2) that the next run reads; `--reset` removes the project's choice so the next layer of `resolve()` answers; `select-scheme` also regenerates `buildServer.json` for the new scheme; `select-configuration` lists a workspace's configurations from one project it references: the one holding the chosen scheme's file, else the first that lists any |
 | `setup [--project <dir>] [--user] [--yes]` | §6.1 |
 | `refresh` | Re-run preflight (Tuist project regeneration) + touch buildServer.json + print "restart LSP" hint (`editor: restart language server`) |
 | `doctor` | Checks: Xcode + `xcrun -f lldb-dap`, simctl works, requested sim exists/booted, sourcekit-lsp, `buildServer.json` present + fresh + `argv` launching the built-in `bsp` server + recorded `build_root`/scheme still valid, compile-store health, rustup (dev), pidfile staleness, binary version vs extension expectation |

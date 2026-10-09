@@ -39,6 +39,14 @@ Tested with: recorded when this becomes a release.
   re-read it and keep every key they do not know.
 - A git worktree without its own choice uses the main checkout's: it reads
   the main checkout's store, and nothing is copied into the worktree.
+- `xcode-dap select-configuration` chooses the build configuration
+  (interactively, or with `--set` and `--list`); for a workspace it lists the
+  configurations of the project that holds the chosen scheme, else of the
+  first project that lists any. `select-scheme`, `select-device` and
+  `select-configuration` take `--reset`, which forgets the project's choice:
+  the next build takes that value from the main checkout's choice, the
+  scenario or the automatic choice. `select-destination` is another name for
+  `select-device`.
 
 ### Changed
 
@@ -48,13 +56,19 @@ Tested with: recorded when this becomes a release.
   Destination and Configuration comes from the first place that sets it: the
   selection store, the main checkout's store (in a worktree), the scenario's
   `scheme` / `device` + `os` / `configuration` keys, then the automatic choice.
-  The flags of `xcode-dap build`, `run` and `clean` still rank below the store,
-  as in 0.1, and in a worktree also below the main checkout's store, so ⌘B
-  builds what ⌘R builds. Before anything boots, a scheme the container does
-  not have, a configuration an `.xcodeproj` does not list, several schemes
-  with none chosen, and a destination that is not available stop with a
-  message that names the picker; one console line shows each value and where
-  it came from.
+  Before anything boots, a scheme the container does not have, a
+  configuration an `.xcodeproj` does not list, several schemes with none
+  chosen, and a destination that is not available stop with a message that
+  names the picker; one console line shows each value and where it came
+  from.
+- `xcode-dap build`, `run` and `clean` need no flags: the workspace is found
+  in the project, and Scheme, Destination and Configuration come from the
+  project's choices. `--scheme`, `--destination` (a UDID or a simulator name;
+  0.1's `--device` still works), `--os` and `--configuration` override them
+  for that one command and are never saved. The tasks 0.1's setup wrote into
+  `.zed/tasks.json` keep 0.1's order: the project's choices outrank their
+  baked flags (in a worktree the main checkout's too, so ⌘B builds what ⌘R
+  builds), and each run prints one line on how to migrate.
 - A scenario that does not parse no longer fails before the binary is
   downloaded: Xcode Tools downloads `xcode-dap` first, then names the key at
   fault and says where Scheme, Destination and Configuration are chosen.

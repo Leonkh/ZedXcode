@@ -14,7 +14,8 @@
 //!
 //! A workspace's `-list` names only schemes; its configurations stay empty
 //! here and are not validated (they are read from the scheme's project
-//! later).
+//! later). The configuration picker lists those of one of the workspace's
+//! projects ([`configurations`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -51,8 +52,24 @@ struct Cache {
 
 /// The schemes and configurations of `container` (absolute), from the cache
 /// when the container has not changed, else from `xcodebuild -list` (one
-/// line to `sink` first: it can take a while).
+/// line to `sink` first: it can take a while). A container without schemes
+/// is an error: there is nothing to build.
 pub async fn list(container: &Path, sink: &dyn OutputSink) -> Result<SchemeList> {
+    let list = read_listing(container, sink).await?;
+    if list.schemes.is_empty() {
+        return Err(anyhow!("the scheme list is empty")).with_context(|| {
+            format!(
+                "unexpected `xcodebuild -list` output for {}",
+                container.display()
+            )
+        });
+    }
+    Ok(list)
+}
+
+/// [`list`] without its demand for schemes: a workspace's projects may list
+/// configurations and no scheme (their schemes live in the workspace).
+async fn read_listing(container: &Path, sink: &dyn OutputSink) -> Result<SchemeList> {
     let key = cache_key(container).map_err(|_| {
         anyhow!(
             "{} does not exist; generate the project first",
@@ -102,7 +119,7 @@ pub async fn list(container: &Path, sink: &dyn OutputSink) -> Result<SchemeList>
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let list = parse(&out.stdout).with_context(|| {
+    let list = parse_listing(&out.stdout).with_context(|| {
         format!(
             "unexpected `xcodebuild -list` output for {}",
             container.display()
@@ -119,13 +136,72 @@ pub async fn list(container: &Path, sink: &dyn OutputSink) -> Result<SchemeList>
     Ok(list)
 }
 
-/// `xcodebuild -list -json` stdout -> the scheme list. A container without
-/// schemes is an error: there is nothing to build.
+/// The build configurations to choose from in `container` (absolute): a
+/// project's own; for a workspace, those of the first of its projects that
+/// lists any, trying first the project that holds `scheme`'s file (the one
+/// chosen, if any). One project is enough, and reading each of a large
+/// workspace's projects would take minutes: every project's `-list` is a
+/// separate xcodebuild run. When no project lists configurations, the last
+/// error, if any.
+pub async fn configurations(
+    container: &Path,
+    scheme: Option<&str>,
+    sink: &dyn OutputSink,
+) -> Result<Vec<String>> {
+    if container_flag(container) == "-project" {
+        return Ok(read_listing(container, sink).await?.configurations);
+    }
+    let mut failure = None;
+    for project in projects_by_scheme(container, scheme) {
+        match read_listing(&project, sink).await {
+            Ok(list) if !list.configurations.is_empty() => return Ok(list.configurations),
+            Ok(_) => {}
+            Err(e) => failure = Some(e),
+        }
+    }
+    failure.map_or(Ok(Vec::new()), Err)
+}
+
+/// The existing projects of `workspace`, those that hold a file for
+/// `scheme` (shared or a user's) first.
+fn projects_by_scheme(workspace: &Path, scheme: Option<&str>) -> Vec<PathBuf> {
+    let mut projects: Vec<PathBuf> = workspace_projects(workspace)
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect();
+    if let Some(scheme) = scheme {
+        let file = format!("{scheme}.xcscheme");
+        let holds = |project: &Path| {
+            let mut dirs = vec![project.join("xcshareddata").join("xcschemes")];
+            if let Ok(users) = fs::read_dir(project.join("xcuserdata")) {
+                dirs.extend(users.flatten().map(|u| u.path().join("xcschemes")));
+            }
+            dirs.iter().any(|dir| dir.join(&file).is_file())
+        };
+        // A stable sort: the others keep their order.
+        projects.sort_by_key(|p| !holds(p));
+    }
+    projects
+}
+
+/// `xcodebuild -list -json` stdout -> the scheme list, as [`list`] reads
+/// it (a container without schemes is an error); the tests' canned output
+/// goes through it.
+#[cfg(test)]
+pub fn parse(bytes: &[u8]) -> Result<SchemeList> {
+    let list = parse_listing(bytes)?;
+    if list.schemes.is_empty() {
+        bail!("the scheme list is empty");
+    }
+    Ok(list)
+}
+
+/// [`parse`] without its demand for schemes.
 ///
 /// When xcodebuild resolves Swift packages first, it prints its progress
 /// ("Resolve Package Graph", the resolved packages) to stdout before the
 /// JSON, so the JSON is read from the first line that starts with `{`.
-pub fn parse(bytes: &[u8]) -> Result<SchemeList> {
+fn parse_listing(bytes: &[u8]) -> Result<SchemeList> {
     let start = bytes
         .iter()
         .enumerate()
@@ -151,12 +227,8 @@ pub fn parse(bytes: &[u8]) -> Result<SchemeList> {
             })
             .unwrap_or_default()
     };
-    let schemes = strings("schemes");
-    if schemes.is_empty() {
-        bail!("the scheme list is empty");
-    }
     Ok(SchemeList {
-        schemes,
+        schemes: strings("schemes"),
         configurations: strings("configurations"),
     })
 }
@@ -424,6 +496,65 @@ mod tests {
         assert!(parse(b"not json").is_err());
         assert!(parse(&bytes(json!({ "workspace": { "schemes": [] } }))).is_err());
         assert!(parse(&bytes(json!({ "other": {} }))).is_err());
+    }
+
+    #[test]
+    fn a_project_without_schemes_still_lists_its_configurations() {
+        // A workspace's project whose schemes live in the workspace.
+        let project = json!({ "project": { "name": "Core", "schemes": [],
+                                           "configurations": ["Debug", "Release", "Beta"] } });
+        assert_eq!(
+            parse_listing(&bytes(project.clone())).unwrap(),
+            SchemeList {
+                schemes: vec![],
+                configurations: vec!["Debug".into(), "Release".into(), "Beta".into()],
+            }
+        );
+        // Nothing to build in it, though.
+        assert!(parse(&bytes(project)).is_err());
+    }
+
+    #[test]
+    fn configurations_come_first_from_the_project_that_holds_the_scheme() {
+        let dir = sandbox();
+        let ws = dir.join("MyApp.xcworkspace");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(
+            ws.join("contents.xcworkspacedata"),
+            "<Workspace version = \"1.0\">\n\
+             <FileRef location = \"group:Modules/Core/Core.xcodeproj\"></FileRef>\n\
+             <FileRef location = \"group:App/MyApp.xcodeproj\"></FileRef>\n\
+             <FileRef location = \"group:Kit/Kit.xcodeproj\"></FileRef>\n\
+             <FileRef location = \"group:Gone/Gone.xcodeproj\"></FileRef>\n</Workspace>\n",
+        )
+        .unwrap();
+        let app = dir.join("App/MyApp.xcodeproj");
+        let core = dir.join("Modules/Core/Core.xcodeproj");
+        let kit = dir.join("Kit/Kit.xcodeproj");
+        for project in [&app, &core, &kit] {
+            fs::create_dir_all(project).unwrap();
+        }
+        fs::create_dir_all(app.join("xcshareddata/xcschemes")).unwrap();
+        fs::write(
+            app.join("xcshareddata/xcschemes/MyApp.xcscheme"),
+            "<Scheme/>",
+        )
+        .unwrap();
+        let user_schemes = kit.join("xcuserdata/jane.xcuserdatad/xcschemes");
+        fs::create_dir_all(&user_schemes).unwrap();
+        fs::write(user_schemes.join("Kit Demo.xcscheme"), "<Scheme/>").unwrap();
+
+        // A project that does not exist is not tried.
+        let sorted = vec![app.clone(), kit.clone(), core.clone()];
+        assert_eq!(projects_by_scheme(&ws, None), sorted);
+        assert_eq!(projects_by_scheme(&ws, Some("Widget")), sorted);
+        assert_eq!(
+            projects_by_scheme(&ws, Some("Kit Demo")),
+            [kit.clone(), app.clone(), core.clone()]
+        );
+        assert_eq!(projects_by_scheme(&ws, Some("MyApp")), sorted);
+        fs::rename(&app, dir.join("App/Renamed.xcodeproj")).unwrap();
+        assert_eq!(projects_by_scheme(&ws, Some("MyApp")), [kit, core]);
     }
 
     #[test]
