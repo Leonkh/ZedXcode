@@ -12,6 +12,10 @@
 //! decide about the git-exclude first-create and the `editor: restart
 //! language server` hint.
 
+// Also runs in DAP mode (the build pipeline regenerates the file), whose
+// stdout carries only framed messages: no `print!` / `println!` here.
+#![deny(clippy::print_stdout)]
+
 use std::path::Path;
 
 use anyhow::Result;

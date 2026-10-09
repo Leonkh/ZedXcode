@@ -1,14 +1,36 @@
-# Release pipeline for the xcode-dap proxy binary.
+# Release pipeline for the xcode-dap binary, Apple silicon only.
 #
-# Triggered by tags like `xcode-dap-v0.1.0`. Produces per-arch tar.gz assets
-# whose names MUST match the contract in extension/src/lib.rs
-# (cached_or_downloaded_proxy):
+#   gate     scripts/gate.sh, the same check CI runs on every push
+#   release  builds xcode-dap for aarch64-apple-darwin, signs it ad hoc,
+#            packages it and uploads the files as the workflow artifact
+#            `release-assets`
+#   publish  for a pushed tag only: creates the GitHub release from that
+#            artifact; the only job that may write to the repository
 #
-#   <tag>-<arch>-apple-darwin.tar.gz        arch ∈ {aarch64, x86_64}
-#   e.g. xcode-dap-v0.1.0-aarch64-apple-darwin.tar.gz
+# Triggers:
 #
-# Each archive contains a single ad-hoc-signed `xcode-dap` binary at the
-# archive root.
+#   a pushed tag xcode-dap-vX.Y.Z   a release; all five version declarations
+#                                   must equal the tag
+#                                   (scripts/check-versions.sh)
+#   workflow_dispatch               a dry run: gate, build, sign, package and
+#                                   upload the artifact; no release
+#   pull_request (paths below)      the same dry run. GitHub offers
+#                                   workflow_dispatch only for workflows on
+#                                   the default branch, so a change to the
+#                                   release pipeline is rehearsed here before
+#                                   it merges.
+#
+# The asset name MUST match the contract in extension/src/lib.rs
+# (cached_or_downloaded_proxy). A release carries exactly two files:
+#
+#   <tag>-aarch64-apple-darwin.tar.gz   e.g. xcode-dap-v0.1.0-aarch64-apple-darwin.tar.gz
+#   SHA256SUMS.txt                      its SHA-256 checksum
+#
+# The archive holds a single ad-hoc-signed arm64 `xcode-dap` binary at its
+# root. Intel Macs are not supported, so there is no Intel asset.
+#
+# Third-party actions are pinned to a full commit SHA (the tag is in the
+# trailing comment).
 
 name: Release xcode-dap
 
@@ -16,60 +38,176 @@ on:
   push:
     tags:
       - "xcode-dap-v*"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "scripts/release.sh"
+      - "scripts/check-versions.sh"
 
+# Read-only by default; the publish job alone gets write access.
 permissions:
-  contents: write
+  contents: read
+
+# A pull request update cancels the dry run still in progress for that pull
+# request; tag and dispatched runs always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# bash with -e and -o pipefail for every step (the implicit default has no
+# pipefail).
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  release:
-    name: Build, sign and release
-    runs-on: macos-14
+  gate:
+    name: Gate
+    runs-on: macos-26
+    timeout-minutes: 60
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Install Rust targets
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Install Rust 1.96.0
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal -c rustfmt,clippy -t wasm32-wasip2
+          rustup default 1.96.0
+
+      - name: Show the toolchain
+        run: |
+          rustc --version
+          cargo --version
+          xcodebuild -version
+          xcrun --find lldb-dap
+          python3 --version
+
+      # The mock DAP session attaches lldb-dap to a local process; a hosted
+      # runner allows that only with developer mode on.
+      - name: Allow the debugger to attach
+        run: sudo DevToolsSecurity -enable
+
+      - name: Gate
+        run: scripts/gate.sh
+
+  release:
+    name: Build, sign and package (aarch64)
+    needs: gate
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The job only builds xcode-dap: no rustfmt, clippy or wasm target.
+      - name: Install Rust 1.96.0
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal -t aarch64-apple-darwin
+          rustup default 1.96.0
+          rustc --version
+
+      # A pushed tag must equal all five declarations; a dry run has no tag,
+      # so they only have to agree with each other.
+      - name: Check the versions
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_TYPE" == tag ]]; then
+            scripts/check-versions.sh "$GITHUB_REF_NAME"
+          else
+            scripts/check-versions.sh
+          fi
 
       - name: Build (aarch64-apple-darwin)
         run: cargo build --release --locked -p xcode-dap --target aarch64-apple-darwin
 
-      - name: Build (x86_64-apple-darwin)
-        run: cargo build --release --locked -p xcode-dap --target x86_64-apple-darwin
-
-      - name: Sanity-check binary version against the tag
+      - name: Sign and package
         run: |
           set -euo pipefail
-          version="$(./target/aarch64-apple-darwin/release/xcode-dap --version | awk '{print $2}')"
-          expected="${GITHUB_REF_NAME#xcode-dap-v}"
-          echo "binary: $version / tag: $expected"
-          test "$version" = "$expected"
+          dir="target/aarch64-apple-darwin/release"
+          bin="$dir/xcode-dap"
+          archs="$(lipo -archs "$bin")"
+          if [[ "$archs" != arm64 ]]; then
+            echo "::error::$bin holds the architectures \"$archs\"; expected arm64 only"
+            exit 1
+          fi
+          # The binary reports its crate version, which the version check tied
+          # to the tag (on a dry run, to the other declarations).
+          version="$("$bin" --version | awk '{print $2}')"
+          asset="xcode-dap-v${version}-aarch64-apple-darwin.tar.gz"
 
-      - name: Sign and package
+          # Ad-hoc signature: arm64 macOS refuses to run unsigned binaries,
+          # and Zed's downloader does not quarantine files, so this is enough.
+          codesign --force -s - "$bin"
+          rm -rf dist
+          mkdir dist
+          # Single binary at the archive root (extension/src/lib.rs contract).
+          # COPYFILE_DISABLE prevents macOS tar from adding ._* entries.
+          COPYFILE_DISABLE=1 tar -czf "dist/$asset" -C "$dir" xcode-dap
+          (cd dist && shasum -a 256 "$asset" | tee SHA256SUMS.txt)
+
+          # The release carries exactly these two files.
+          entries="$(tar -tzf "dist/$asset")"
+          if [[ "$entries" != xcode-dap ]]; then
+            echo "::error::$asset must hold only xcode-dap, found: $(tr '\n' ' ' <<<"$entries")"
+            exit 1
+          fi
+          found="$(ls -A dist | sort)"
+          expected="$(printf '%s\n' "$asset" SHA256SUMS.txt | sort)"
+          if [[ "$found" != "$expected" ]]; then
+            echo "::error::dist must hold only $asset and SHA256SUMS.txt, found: $(tr '\n' ' ' <<<"$found")"
+            exit 1
+          fi
+          echo "packaged: $asset, SHA256SUMS.txt"
+
+      - name: Upload the release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish the GitHub release
+    needs: release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/xcode-dap-v')
+    runs-on: macos-26
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      # The files the release job built and signed, unchanged.
+      - name: Download the release assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Verify the assets
         env:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          mkdir -p dist
-          for arch in aarch64 x86_64; do
-            bin="target/${arch}-apple-darwin/release/xcode-dap"
-            # Ad-hoc signature: arm64 macOS refuses to run unsigned binaries,
-            # and Zed's downloader does not quarantine files, so this is enough.
-            codesign --force -s - "$bin"
-            # Single binary at the archive root (extension/src/lib.rs contract).
-            # COPYFILE_DISABLE prevents macOS tar from adding ._* entries.
-            COPYFILE_DISABLE=1 tar -czf \
-              "dist/${TAG}-${arch}-apple-darwin.tar.gz" \
-              -C "target/${arch}-apple-darwin/release" xcode-dap
-          done
-          (cd dist && shasum -a 256 ./*.tar.gz | tee SHA256SUMS.txt)
+          asset="dist/${TAG}-aarch64-apple-darwin.tar.gz"
+          if [[ ! -f "$asset" ]]; then
+            echo "::error::no $asset for tag $TAG; the artifact holds: $(ls -A dist | tr '\n' ' ')"
+            exit 1
+          fi
+          (cd dist && shasum -a 256 -c SHA256SUMS.txt)
 
-      - name: Create GitHub release
+      - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           gh release create "$TAG" \
-            dist/*.tar.gz dist/SHA256SUMS.txt \
+            "dist/${TAG}-aarch64-apple-darwin.tar.gz" dist/SHA256SUMS.txt \
+            --verify-tag \
             --title "$TAG" \
-            --notes "xcode-dap release \`$TAG\`: per-arch macOS binaries (ad-hoc signed) for the Xcode Tools Zed extension. Checksums in SHA256SUMS.txt."
+            --notes "xcode-dap release \`$TAG\`: the macOS binary for Apple silicon (arm64, ad-hoc signed) for the Xcode Tools Zed extension. Checksum in SHA256SUMS.txt."

@@ -22,10 +22,15 @@ pub enum ClientMsg<'a> {
         seq: i64,
         args: Value,
     },
-    /// `seq` is kept so the proxy can answer the disconnect itself when it
-    /// cancels a mid-build pipeline (no lldb-dap roundtrip).
+    /// `disconnect` or `terminate`: either one ends the session. Zed sends
+    /// `terminate` in place of `disconnect` when the adapter advertises
+    /// `supportsTerminateRequest`, and kills the adapter as soon as either is
+    /// answered, so the proxy handles both alike. `seq` and `command` are
+    /// kept so the proxy can answer the request itself (after a cancelled
+    /// pipeline, or when lldb-dap does not answer in time).
     Disconnect {
         seq: i64,
+        command: &'static str,
         raw: &'a [u8],
     },
     Other {
@@ -58,9 +63,14 @@ pub fn classify_client(raw: &[u8]) -> Result<ClientMsg<'_>> {
                 let args = v.get("arguments").cloned().unwrap_or(Value::Null);
                 return Ok(ClientMsg::Launch { seq, args });
             }
-            Some("disconnect") => {
+            Some(name @ ("disconnect" | "terminate")) => {
                 let seq = v.get("seq").and_then(Value::as_i64).unwrap_or(0);
-                return Ok(ClientMsg::Disconnect { seq, raw });
+                let command = if name == "terminate" {
+                    "terminate"
+                } else {
+                    "disconnect"
+                };
+                return Ok(ClientMsg::Disconnect { seq, command, raw });
             }
             _ => {}
         }
@@ -79,6 +89,16 @@ pub fn classify_child(raw: &[u8]) -> Result<ChildMsg<'_>> {
         }
     }
     Ok(ChildMsg::Other { raw })
+}
+
+/// Whether `raw` is a response to the request with seq `request_seq` (how
+/// the proxy spots lldb-dap's answer to a forwarded `disconnect`).
+pub fn is_response_to(raw: &[u8], request_seq: i64) -> bool {
+    let Ok(v) = serde_json::from_slice::<Value>(raw) else {
+        return false;
+    };
+    v.get("type").and_then(Value::as_str) == Some("response")
+        && v.get("request_seq").and_then(Value::as_i64) == Some(request_seq)
 }
 
 /// Compact one-line summary of a DAP frame for DEBUG logging: type,
@@ -158,7 +178,8 @@ pub fn error_response(request_seq: i64, command: &str, msg: &str) -> Value {
 }
 
 /// Bare success response for an intercepted request (used to answer a
-/// `disconnect` that cancelled a mid-build pipeline).
+/// `disconnect` / `terminate` the proxy owns: one that cancelled a mid-build
+/// pipeline, came after the session ended, or that lldb-dap never answered).
 pub fn success_response(request_seq: i64, command: &str) -> Value {
     json!({
         "type": "response",
@@ -241,12 +262,56 @@ mod tests {
     fn classifies_disconnect() {
         let raw = br#"{"seq":9,"type":"request","command":"disconnect","arguments":{}}"#;
         match classify_client(raw).unwrap() {
-            ClientMsg::Disconnect { seq, raw: r } => {
+            ClientMsg::Disconnect {
+                seq,
+                command,
+                raw: r,
+            } => {
                 assert_eq!(seq, 9);
+                assert_eq!(command, "disconnect");
                 assert_eq!(r, raw);
             }
             _ => panic!("expected Disconnect"),
         }
+    }
+
+    #[test]
+    fn classifies_terminate_like_disconnect() {
+        // Zed sends `terminate` instead of `disconnect` when the adapter
+        // advertises supportsTerminateRequest; both end the session.
+        let raw =
+            br#"{"seq":12,"type":"request","command":"terminate","arguments":{"restart":false}}"#;
+        match classify_client(raw).unwrap() {
+            ClientMsg::Disconnect {
+                seq,
+                command,
+                raw: r,
+            } => {
+                assert_eq!(seq, 12);
+                assert_eq!(command, "terminate");
+                assert_eq!(r, raw);
+            }
+            _ => panic!("expected Disconnect for terminate"),
+        }
+        // A `terminated` event is not a request to stop.
+        let ev = br#"{"seq":0,"type":"event","event":"terminated"}"#;
+        assert!(matches!(
+            classify_client(ev).unwrap(),
+            ClientMsg::Other { .. }
+        ));
+    }
+
+    #[test]
+    fn is_response_to_matches_only_that_request() {
+        let resp = br#"{"seq":40,"type":"response","request_seq":9,"command":"disconnect","success":true}"#;
+        assert!(is_response_to(resp, 9));
+        assert!(!is_response_to(resp, 10));
+        // An event or a request carrying the same numbers is not a response.
+        let ev = br#"{"seq":9,"type":"event","event":"terminated","request_seq":9}"#;
+        assert!(!is_response_to(ev, 9));
+        let req = br#"{"seq":9,"type":"request","command":"disconnect"}"#;
+        assert!(!is_response_to(req, 9));
+        assert!(!is_response_to(b"not json", 9));
     }
 
     #[test]

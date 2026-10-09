@@ -2,6 +2,8 @@
 name = "zed-xcode-ext"
 version = "0.1.0"
 edition = "2021"
+# The toolchain Zed's extension registry builds with (CI's extension-msrv job).
+rust-version = "1.90"
 license = "Apache-2.0"
 publish = false
 

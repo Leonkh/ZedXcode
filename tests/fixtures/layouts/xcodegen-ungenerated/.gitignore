@@ -1,0 +1,4 @@
+# Written by generate.sh
+/MyApp.xcodeproj/
+# Machine-local settings, copied from Config/Local.xcconfig.example
+/Config/Local.xcconfig

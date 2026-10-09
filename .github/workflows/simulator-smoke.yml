@@ -1,0 +1,184 @@
+# Simulator smoke test: scripts/smoke-sim.sh builds MyApp with `xcode-dap run`,
+# boots a simulator, launches the app and checks its console (print() lines
+# arrive as they are written and are still there after the app is terminated)
+# and the pipeline log, once on Xcode 26 (macos-26) and once on Xcode 27.0 (the
+# xcode-27 runner). Each leg fails when its Xcode is not the major version it
+# stands for, or is a beta, and when xcode-dap opened another app for the
+# simulator window than that Xcode's (Simulator on 26, Device Hub on 27).
+#
+# A leg takes minutes and boots a simulator, so the test does not run on every
+# push: it runs on demand, for release tags, and for pull requests that touch
+# the launch path it covers (the paths below).
+#
+# Third-party actions are pinned to a full commit SHA (the tag is in the
+# trailing comment).
+
+name: Simulator smoke
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "xcode-dap-v*"
+  pull_request:
+    paths:
+      - "crates/xcode-dap/src/engine/**"
+      - "crates/xcode-dap/src/dap/**"
+      - "crates/xcode-dap/src/commands/run.rs"
+      # The console lines and Ctrl-C handling of `run`, the log line format
+      # and run dirs, and the dependencies: the test reads all of them.
+      - "crates/xcode-dap/src/commands/build.rs"
+      - "crates/xcode-dap/src/main.rs"
+      - "crates/xcode-dap/src/util/**"
+      - "Cargo.lock"
+      - "scripts/smoke-sim.sh"
+      - "tests/fixtures/myapp/**"
+      - ".github/workflows/simulator-smoke.yml"
+
+permissions:
+  contents: read
+
+# A pull request update cancels the run still in progress for that pull
+# request; dispatched and tag runs always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# bash with -e and -o pipefail for every step (the implicit default has no
+# pipefail).
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  smoke:
+    name: Simulator smoke (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # xcode: the version to select ("" = the image's default);
+        # major: the major version the leg must end up on;
+        # window: the app xcode-dap must open to show the simulator (Device
+        # Hub replaced Simulator in Xcode 27).
+        include:
+          - runner: macos-26
+            xcode: ""
+            major: "26"
+            window: Simulator.app
+          - runner: xcode-27
+            xcode: "27.0"
+            major: "27"
+            window: DeviceHub.app
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Xcode 27.0 GA only: a beta or release candidate installed next to it
+      # never counts.
+      - name: Select Xcode ${{ matrix.xcode }}
+        if: matrix.xcode != ''
+        env:
+          XCODE_VERSION: ${{ matrix.xcode }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob nocasematch
+          picked=""
+          # The exact name first: the glob also matches point releases.
+          for app in "/Applications/Xcode_${XCODE_VERSION}.app" "/Applications/Xcode_${XCODE_VERSION}"*.app; do
+            [[ -d "$app" ]] || continue
+            name="${app##*/}"
+            if [[ "$name" =~ beta|_rc|release.?candidate ]]; then
+              echo "skipping $name: not a GA release"
+              continue
+            fi
+            picked="$app"
+            break
+          done
+          if [[ -z "$picked" ]]; then
+            echo "::error::no GA Xcode ${XCODE_VERSION} in /Applications; found: $(printf '%s ' /Applications/Xcode*.app)"
+            exit 1
+          fi
+          sudo xcode-select --switch "$picked/Contents/Developer"
+          version="$(xcodebuild -version)"
+          echo "$version"
+          first_line="${version%%$'\n'*}"
+          case "$first_line" in
+            "Xcode $XCODE_VERSION" | "Xcode $XCODE_VERSION".[0-9]*) ;;
+            *)
+              echo "::error::$picked reports \"$first_line\", expected Xcode ${XCODE_VERSION}"
+              exit 1
+              ;;
+          esac
+
+      # Also guards the image default on macos-26, which could move to a newer
+      # Xcode. `xcodebuild -version` never says "beta", and beta and GA build
+      # numbers look alike; a beta app carries the beta icon.
+      - name: Check Xcode ${{ matrix.major }}
+        env:
+          XCODE_MAJOR: ${{ matrix.major }}
+        run: |
+          set -euo pipefail
+          app="$(xcode-select -p)"
+          app="${app%/Contents/Developer}"
+          version="$(xcodebuild -version)"
+          first_line="${version%%$'\n'*}"
+          case "$first_line" in
+            "Xcode $XCODE_MAJOR."*) ;;
+            *)
+              echo "::error::this leg tests Xcode ${XCODE_MAJOR}, but $app reports \"$first_line\""
+              exit 1
+              ;;
+          esac
+          icon="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$app/Contents/Info.plist" 2>/dev/null || true)"
+          echo "$app: $first_line, icon ${icon:-<none>}"
+          if [[ "$icon" == *[Bb]eta* ]]; then
+            echo "::error::$app is a beta (app icon $icon)"
+            exit 1
+          fi
+
+      - name: Show Xcode and the simulators
+        run: |
+          xcode-select -p
+          xcodebuild -version
+          xcrun simctl list runtimes
+          xcrun simctl list devices available
+
+      # The xcode-27 image may come without rustup.
+      - name: Install rustup if missing
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+                sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+            fi
+            echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+          fi
+
+      # The leg only builds xcode-dap: no rustfmt, clippy or wasm target.
+      - name: Install Rust 1.96.0
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+          rustc --version
+
+      - name: Build xcode-dap
+        run: cargo build --locked
+
+      - name: Smoke test
+        env:
+          SMOKE_SIMULATOR_WINDOW: ${{ matrix.window }}
+        run: scripts/smoke-sim.sh --binary target/debug/xcode-dap --log-dir "$RUNNER_TEMP/smoke-logs" tests/fixtures/myapp
+
+      - name: Upload the logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: simulator-smoke-${{ matrix.runner }}
+          path: ${{ runner.temp }}/smoke-logs
+          if-no-files-found: warn
+          retention-days: 14

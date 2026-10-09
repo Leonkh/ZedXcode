@@ -13,10 +13,15 @@
 //! - `configurationDone` passes through verbatim; lldb-dap itself resumes
 //!   the attached process afterwards (plain pid attach, no stopOnEntry),
 //!   which yields the auto-continue.
+//! - `disconnect` / `terminate` end the session and are answered last:
+//!   Zed waits for that answer with no timeout and kills the adapter as soon
+//!   as it arrives, so a bounded critical teardown (OSLog group, final
+//!   console drain, app terminate, pidfile, lldb-dap) runs first.
 //! - The hidden `--mock-pipeline` mode skips xcodebuild/simctl entirely and
 //!   attaches lldb-dap to a locally compiled dummy process, exercising the
 //!   whole DAP flow without Xcode in seconds.
 
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +32,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use xcode_dap_config::LaunchConfig;
 
@@ -35,7 +41,7 @@ use crate::dap::lldb::LldbDap;
 use crate::dap::peek::{self, ChildMsg, ClientMsg};
 use crate::engine::consoles::{self, Tailers};
 use crate::engine::pipeline::{self, LaunchedApp, OutputSink};
-use crate::engine::simctl;
+use crate::engine::{config, project, selection, simctl};
 use crate::util::logging;
 use crate::util::pidfile;
 
@@ -46,17 +52,52 @@ const INIT_GUARD: Duration = Duration::from_secs(2);
 /// How long teardown waits for children / writer flushes.
 const TEARDOWN_GRACE: Duration = Duration::from_secs(2);
 
-/// How long a forwarded (live-debuggee) `disconnect` waits for lldb-dap to
-/// exit on its own before the proxy owns the shutdown itself. Guards the wedge
-/// class where lldb-dap kills its simulator debuggee on disconnect but then
-/// never exits — leaving the routing loop hung until Zed force-kills the
-/// adapter. A healthy disconnect completes well under this.
+/// How long a forwarded (live-debuggee) `disconnect` / `terminate` waits for
+/// lldb-dap's answer before the proxy owns the shutdown itself. Guards the
+/// wedge class where lldb-dap kills its simulator debuggee on disconnect but
+/// then never answers or exits — leaving the routing loop hung until Zed
+/// force-kills the adapter. A healthy disconnect is answered well under this.
 const DISCONNECT_WEDGE_GRACE: Duration = Duration::from_secs(3);
+
+/// How long lldb-dap may take to answer the attach request. The app waits
+/// suspended under `--wait-for-debugger` until then; past this the launch
+/// fails and teardown terminates the app.
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound on the critical teardown that runs before a `disconnect` /
+/// `terminate` is answered (OSLog group stop, final console drain, app
+/// terminate, pidfile release, lldb-dap reap). Zed waits for that answer
+/// with no timeout, so this bounds how long a Stop can hang.
+const CRITICAL_TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
+
+/// How long a critical-teardown step waits for a child it has just SIGKILLed
+/// to be reaped (the OSLog pump's bounded stop waits the same). These waits
+/// sit outside the graceful waits' shared budget; there are at most
+/// [`FORCED_REAPS`] of them (OSLog group, mock app, lldb-dap), which keeps
+/// the sum within [`CRITICAL_TEARDOWN_BUDGET`].
+const FORCED_REAP_GRACE: Duration = consoles::FORCED_STOP_REAP;
+const FORCED_REAPS: u32 = 3;
+
+/// Step caps inside the critical budget, so one slow step cannot take the
+/// time of the steps after it: the OSLog group is SIGKILLed after its cap,
+/// and the final console drain (one read per capture file) is cut short.
+const OSLOG_STOP_GRACE: Duration = Duration::from_millis(500);
+const CONSOLE_DRAIN_GRACE: Duration = Duration::from_millis(300);
 
 /// How long teardown waits for a cancelled pipeline to wind down. Must
 /// cover xcodebuild's SIGTERM -> 3 s -> SIGKILL escalation (xcodebuild.rs);
 /// exiting earlier would orphan the build (kill_on_drop dies with us).
 const PIPELINE_DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// How long a stop request that cancelled the pipeline waits for it to wind
+/// down before teardown runs anyway, counted from the request's arrival.
+/// Covers the longest cleanup a cancelled step runs (xcodebuild's or the
+/// preflight's SIGTERM -> 3 s -> SIGKILL, a cancelled launch's bounded
+/// terminate). A step that does not wind down in time (one the token does
+/// not reach, a child that hangs on in its kernel call after SIGKILL) must
+/// not hold the answer Zed waits for, so the answer to a mid-pipeline Stop
+/// goes out within this plus [`CRITICAL_TEARDOWN_BUDGET`].
+const PIPELINE_STOP_GRACE: Duration = Duration::from_secs(4);
 
 /// Everything written to Zed (or to the lldb-dap child stdin) goes through
 /// one unbounded mpsc channel -> one writer task, so DAP frames never
@@ -71,7 +112,8 @@ pub enum Out {
 /// Result of one pipeline run handed back to the routing loop.
 struct PipelineDone {
     app: LaunchedApp,
-    /// `None` in mock mode (the mock ignores the scenario config).
+    /// `None` for a mock launch whose arguments are not a valid scenario
+    /// (the mock ignores the build keys; it honors `oslog`).
     config: Option<LaunchConfig>,
     /// The dummy app child in `--mock-pipeline` mode (killed on teardown).
     mock_child: Option<Child>,
@@ -134,6 +176,121 @@ enum LoopAction {
     Exit(i32),
 }
 
+/// A client `disconnect` / `terminate`: the request that ends the session.
+/// It is answered only after the critical teardown: Zed waits for this
+/// answer with no timeout and kills the adapter as soon as it arrives, so
+/// whatever still ran then (the OSLog group, the app, lldb-dap) would be
+/// orphaned and the pidfile left behind.
+struct StopRequest {
+    seq: i64,
+    /// `"disconnect"` or `"terminate"`, echoed in the proxy's own answer.
+    command: &'static str,
+    /// When the request arrived (and cancelled a running pipeline, if any):
+    /// the start of [`PIPELINE_STOP_GRACE`].
+    received: Instant,
+    /// lldb-dap's answer to the forwarded request, passed on verbatim;
+    /// `None` when the proxy answers itself (a bare success).
+    response: Option<Vec<u8>>,
+    /// Follow the answer with a `terminated` event: set for a Stop that
+    /// cancelled the pipeline, where lldb-dap never had a session whose end
+    /// it would report.
+    terminated_event: bool,
+    /// Further stop requests that arrived while this one was pending, each
+    /// answered with a bare success after it.
+    repeats: Vec<(i64, &'static str)>,
+}
+
+impl StopRequest {
+    fn new(seq: i64, command: &'static str) -> Self {
+        Self {
+            seq,
+            command,
+            received: Instant::now(),
+            response: None,
+            terminated_event: false,
+            repeats: Vec::new(),
+        }
+    }
+
+    /// The frames that answer the request (and its repeats), in order.
+    fn answers(self) -> Vec<Out> {
+        let mut out = vec![match self.response {
+            Some(raw) => Out::Raw(raw),
+            None => Out::Msg(peek::success_response(self.seq, self.command)),
+        }];
+        out.extend(
+            self.repeats
+                .into_iter()
+                .map(|(seq, command)| Out::Msg(peek::success_response(seq, command))),
+        );
+        if self.terminated_event {
+            out.push(Out::Msg(peek::terminated_event()));
+        }
+        out
+    }
+}
+
+/// The critical teardown's clock. While a stop request waits for its answer,
+/// every graceful wait takes its slice from one deadline, so however the
+/// steps behave, the hold before the answer stays within
+/// [`CRITICAL_TEARDOWN_BUDGET`]. When no stop request waits (SIGTERM, stdin
+/// EOF, lldb-dap exit, attach timeout), each wait gets the whole
+/// [`TEARDOWN_GRACE`] instead: a `simctl terminate` on a busy Mac can take
+/// more than the second the shared budget would leave it.
+#[derive(Clone, Copy, Debug)]
+struct Budget {
+    /// `None`: no answer is waiting (see [`Budget::unhurried`]).
+    deadline: Option<Instant>,
+}
+
+impl Budget {
+    /// The graceful waits' budget for a pending stop request, starting at
+    /// `now`: the critical budget minus what the forced reaps may need.
+    fn critical(now: Instant) -> Self {
+        Self {
+            deadline: Some(now + graceful_budget()),
+        }
+    }
+
+    /// No answer is waiting: every wait gets [`TEARDOWN_GRACE`].
+    fn unhurried() -> Self {
+        Self { deadline: None }
+    }
+
+    /// How long a wait starting at `now` may take: what is left of the
+    /// budget, at most `cap`. Zero once the budget is spent — the step then
+    /// takes only what is already finished and goes on to its forced
+    /// fallback (SIGKILL), or is skipped. Without a deadline, the
+    /// [`TEARDOWN_GRACE`] whatever the step's critical `cap`.
+    fn slice_at(&self, now: Instant, cap: Duration) -> Duration {
+        match self.deadline {
+            Some(deadline) => cap.min(deadline.saturating_duration_since(now)),
+            None => TEARDOWN_GRACE,
+        }
+    }
+
+    fn slice(&self, cap: Duration) -> Duration {
+        self.slice_at(Instant::now(), cap)
+    }
+}
+
+/// The part of [`CRITICAL_TEARDOWN_BUDGET`] the graceful waits share.
+fn graceful_budget() -> Duration {
+    CRITICAL_TEARDOWN_BUDGET.saturating_sub(FORCED_REAP_GRACE * FORCED_REAPS)
+}
+
+/// How long teardown waits for a pipeline still running at `now`. With a
+/// stop request pending (`stop_received`, which cancelled the pipeline when
+/// it arrived), only what is left of [`PIPELINE_STOP_GRACE`]: the answer
+/// must not wait out a step that ignores the cancel. Otherwise nothing waits
+/// on the adapter and the cancelled build gets [`PIPELINE_DRAIN_GRACE`].
+fn pipeline_drain_grace(stop_received: Option<Instant>, now: Instant) -> Duration {
+    match stop_received {
+        Some(at) => (at + PIPELINE_STOP_GRACE).saturating_duration_since(now),
+        None => PIPELINE_DRAIN_GRACE,
+    }
+}
+
 /// The proxy state machine.
 pub struct Proxy {
     to_client: mpsc::UnboundedSender<Out>,
@@ -154,13 +311,22 @@ pub struct Proxy {
     pipe_tx: mpsc::Sender<Result<PipelineDone>>,
     pipeline_running: bool,
     pipeline_cancel: Option<CancellationToken>,
-    /// Disconnect seq received while the pipeline ran; answered ourselves
-    /// once the cancelled pipeline winds down.
-    pending_disconnect: Option<i64>,
-    /// A live-debuggee `disconnect` we forwarded to lldb-dap: `(seq, deadline)`.
-    /// If lldb-dap has not exited by the deadline (the wedge), the proxy answers
-    /// the disconnect itself and shuts down instead of hanging.
-    disconnect_wait: Option<(i64, tokio::time::Instant)>,
+    /// The client's `disconnect` / `terminate`, answered by teardown once its
+    /// critical part has run (see [`StopRequest`]).
+    stop: Option<StopRequest>,
+    /// Set while a stop request waits: for lldb-dap's answer to the forwarded
+    /// request ([`DISCONNECT_WEDGE_GRACE`]), or for the pipeline it cancelled
+    /// to wind down ([`PIPELINE_STOP_GRACE`]). Past it the routing loop ends
+    /// anyway (a wedged lldb-dap, a step that ignores the cancel) and
+    /// teardown answers the request itself.
+    stop_deadline: Option<Instant>,
+    /// Set while the attach request waits for lldb-dap's answer
+    /// ([`ATTACH_TIMEOUT`]).
+    attach_deadline: Option<Instant>,
+    /// The attach timeout's failure (launch error, stderr line, `terminated`),
+    /// held like a stop request's answer: Zed may end the adapter once it
+    /// sees them, so teardown terminates the suspended app first.
+    held_failure: Vec<Out>,
     /// Launched app once the pipeline succeeded (teardown cleanup).
     session: Option<PipelineDone>,
     /// out.log / err.log tailers, started on successful attach.
@@ -180,7 +346,7 @@ pub struct Proxy {
     /// once the session has ended (which is why Zed disconnects), the proxy
     /// answers the disconnect itself and drives a clean shutdown rather than
     /// delegating to lldb-dap, which can wedge on a disconnect after its
-    /// simulator debuggee died (see `on_client_message`).
+    /// simulator debuggee died (see `on_stop_request`).
     session_ended: bool,
     /// Set only on an `exited` event — the debuggee **process** is gone
     /// (not a mere `terminated`/detach; lldb-dap detaches an attach-by-pid
@@ -189,6 +355,10 @@ pub struct Proxy {
     /// of ours is left to kill (and a successor may now own the bundle id) —
     /// a plain detach must still terminate the app per `terminateOnStop`.
     debuggee_exited: bool,
+    /// Set when lldb-dap left a forwarded stop request unanswered past
+    /// [`DISCONNECT_WEDGE_GRACE`]: teardown then kills it at once instead of
+    /// spending the rest of its budget waiting for an exit.
+    lldb_wedged: bool,
 }
 
 /// Entry point for DAP proxy mode (no subcommand): speak DAP on stdio,
@@ -292,8 +462,10 @@ pub async fn run_dap_mode(mock_pipeline: bool) -> Result<()> {
         pipe_tx,
         pipeline_running: false,
         pipeline_cancel: None,
-        pending_disconnect: None,
-        disconnect_wait: None,
+        stop: None,
+        stop_deadline: None,
+        attach_deadline: None,
+        held_failure: Vec::new(),
         session: None,
         tailers: None,
         oslog: None,
@@ -301,6 +473,7 @@ pub async fn run_dap_mode(mock_pipeline: bool) -> Result<()> {
         attached: false,
         session_ended: false,
         debuggee_exited: false,
+        lldb_wedged: false,
     };
 
     // --- main routing loop -------------------------------------------------
@@ -314,9 +487,10 @@ pub async fn run_dap_mode(mock_pipeline: bool) -> Result<()> {
     // children, remove the pidfile, and flush queued client frames.
     let mut exit_code = 0;
     loop {
-        // Copy the disconnect deadline out before the select so the timer arm
-        // does not borrow `proxy` (the message arms need `&mut proxy`).
-        let disc_deadline = proxy.disconnect_wait.map(|(_, d)| d);
+        // Copy the deadlines out before the select so the timer arms do not
+        // borrow `proxy` (the message arms need `&mut proxy`).
+        let stop_deadline = proxy.stop_deadline;
+        let attach_deadline = proxy.attach_deadline;
         tokio::select! {
             msg = client_reader.next_message() => match msg {
                 Ok(Some(raw)) => match proxy.on_client_message(&raw) {
@@ -353,7 +527,7 @@ pub async fn run_dap_mode(mock_pipeline: bool) -> Result<()> {
             // `pipe_tx` lives in `proxy`, so `recv()` pends when idle.
             res = pipe_rx.recv(), if proxy.pipeline_running => {
                 if let Some(res) = res {
-                    match proxy.on_pipeline_result(res).await {
+                    match proxy.on_pipeline_result(res) {
                         Ok(LoopAction::Continue) => {}
                         Ok(LoopAction::Exit(code)) => { exit_code = code; break; }
                         Err(e) => {
@@ -365,18 +539,27 @@ pub async fn run_dap_mode(mock_pipeline: bool) -> Result<()> {
                     }
                 }
             },
-            // Bounded fallback for a forwarded live-debuggee disconnect: if
-            // lldb-dap wedged (killed the debuggee but never exited), answer Zed
-            // ourselves and shut down instead of hanging forever.
-            () = wait_opt_deadline(disc_deadline) => {
-                if let Some((seq, _)) = proxy.disconnect_wait.take() {
-                    log::info!(
-                        "disconnect (seq {seq}): lldb-dap did not exit within {}s — \
-                         owning the shutdown",
-                        DISCONNECT_WEDGE_GRACE.as_secs()
-                    );
-                    proxy.send_to_client(Out::Msg(peek::success_response(seq, "disconnect")));
-                    break;
+            // Bounded fallback for a pending stop request: if lldb-dap wedged
+            // (killed the debuggee but never answered), or the cancelled
+            // pipeline has not wound down, shut down instead of hanging;
+            // teardown answers Zed itself.
+            () = wait_opt_deadline(stop_deadline) => {
+                proxy.stop_deadline = None;
+                proxy.on_stop_deadline();
+                break;
+            }
+            // The app waits suspended for the debugger: give up on an attach
+            // lldb-dap never answers instead of leaving it frozen.
+            () = wait_opt_deadline(attach_deadline) => {
+                proxy.attach_deadline = None;
+                match proxy.on_attach_timeout() {
+                    Ok(LoopAction::Continue) => {}
+                    Ok(LoopAction::Exit(code)) => { exit_code = code; break; }
+                    Err(e) => {
+                        log::error!("error handling the attach timeout: {e:#}");
+                        exit_code = 1;
+                        break;
+                    }
                 }
             }
             _ = sigterm.recv() => {
@@ -409,8 +592,8 @@ pub async fn run_dap_mode(mock_pipeline: bool) -> Result<()> {
 }
 
 /// Sleep until `deadline` if set, else pend forever — the disabled state of the
-/// routing loop's disconnect-wedge timer arm.
-async fn wait_opt_deadline(deadline: Option<tokio::time::Instant>) {
+/// routing loop's timer arms (stop wedge, attach timeout).
+async fn wait_opt_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(t) => tokio::time::sleep_until(t).await,
         None => std::future::pending().await,
@@ -443,66 +626,82 @@ impl Proxy {
                 Ok(LoopAction::Continue)
             }
             ClientMsg::Launch { seq, args } => self.handle_launch(seq, args, raw),
-            ClientMsg::Disconnect { seq, raw } => {
-                if self.pipeline_running {
-                    // Mid-build Stop: cancel the pipeline (kills the
-                    // xcodebuild process group); the pipe_rx arm answers the
-                    // disconnect once the pipeline has wound down.
-                    log::info!("disconnect received (seq {seq}) mid-pipeline — cancelling");
-                    self.pending_disconnect = Some(seq);
-                    if let Some(cancel) = &self.pipeline_cancel {
-                        cancel.cancel();
-                    }
-                    Ok(LoopAction::Continue)
-                } else if self.session_ended {
-                    // lldb-dap already ended the session (an `exited`/
-                    // `terminated` event) — most often because a second ⌘R's
-                    // `simctl install` replaced the running app's bundle,
-                    // killing it, so lldb-dap emitted `terminated` and Zed is
-                    // now disconnecting. We must NOT just forward and wait for
-                    // lldb-dap to exit: against the simulator debugserver it
-                    // can wedge on a disconnect once its debuggee is gone, so
-                    // the routing loop would wait forever for an exit that
-                    // never comes and Zed force-kills the adapter (the
-                    // perceived "crash"). Own the shutdown instead: forward the
-                    // disconnect so a healthy lldb-dap still detaches, answer
-                    // Zed ourselves, and exit 0. Teardown's bounded lldb-dap
-                    // wait-then-kill covers a wedged child; its belt-and-braces
-                    // `simctl terminate` still runs unless the process actually
-                    // exited (gated by debuggee_exited), so a detach here would
-                    // still terminate the app and we never step on a successor.
-                    log::info!(
-                        "disconnect received (seq {seq}) after session end — \
-                         answering and shutting down"
-                    );
-                    let _ = self.send_to_child_raw(raw);
-                    self.send_to_client(Out::Msg(peek::success_response(seq, "disconnect")));
-                    Ok(LoopAction::Exit(0))
-                } else {
-                    // Live debuggee (no `exited`/`terminated` seen): forward so
-                    // lldb-dap terminates/detaches per the request; its response
-                    // and any `exited`/`terminated` pass back through, and its
-                    // exit normally breaks the loop into teardown. But against
-                    // the simulator debugserver lldb-dap can KILL the debuggee
-                    // on disconnect and then wedge without exiting (common when
-                    // a concurrent Rerun's install is contending on the same
-                    // bundle) — which would hang the loop until Zed force-kills
-                    // the adapter. So arm a bounded wait: if lldb-dap has not
-                    // exited by the deadline, we own the shutdown ourselves
-                    // (see the `disconnect_wait` arm in the routing loop).
-                    log::info!(
-                        "disconnect received (seq {seq}) — forwarding to lldb-dap (bounded)"
-                    );
-                    self.send_to_child_raw(raw)?;
-                    self.disconnect_wait =
-                        Some((seq, tokio::time::Instant::now() + DISCONNECT_WEDGE_GRACE));
-                    Ok(LoopAction::Continue)
-                }
-            }
+            ClientMsg::Disconnect { seq, command, raw } => self.on_stop_request(seq, command, raw),
             ClientMsg::Other { raw } => {
                 self.send_to_child_raw(raw)?;
                 Ok(LoopAction::Continue)
             }
+        }
+    }
+
+    /// A client `disconnect` / `terminate`. Whatever the state, the request is
+    /// answered only after the critical teardown (see [`StopRequest`]); the
+    /// state decides how the routing loop gets there.
+    fn on_stop_request(
+        &mut self,
+        seq: i64,
+        command: &'static str,
+        raw: &[u8],
+    ) -> Result<LoopAction> {
+        if let Some(stop) = &mut self.stop {
+            // A repeat (say `terminate`, then `disconnect`) while the first
+            // is pending is answered right after it.
+            log::info!("{command} received (seq {seq}) while a stop is pending — answered with it");
+            stop.repeats.push((seq, command));
+            return Ok(LoopAction::Continue);
+        }
+        let stop = StopRequest::new(seq, command);
+        let received = stop.received;
+        self.stop = Some(stop);
+        // From here the stop's own path bounds the session's end.
+        self.attach_deadline = None;
+        if self.pipeline_running {
+            // Mid-build Stop: cancel the pipeline (kills the xcodebuild
+            // process group, or the install / launch helper); the pipe_rx arm
+            // leaves the loop once the pipeline has wound down, the
+            // stop_deadline arm after PIPELINE_STOP_GRACE if it has not.
+            log::info!("{command} received (seq {seq}) mid-pipeline — cancelling");
+            if let Some(cancel) = &self.pipeline_cancel {
+                cancel.cancel();
+            }
+            self.stop_deadline = Some(received + PIPELINE_STOP_GRACE);
+            Ok(LoopAction::Continue)
+        } else if self.session_ended {
+            // lldb-dap already ended the session (an `exited`/`terminated`
+            // event) — most often because a second ⌘R's `simctl install`
+            // replaced the running app's bundle, killing it, so lldb-dap
+            // emitted `terminated` and Zed is now disconnecting. We must NOT
+            // forward and wait for lldb-dap: against the simulator debugserver
+            // it can wedge on a disconnect once its debuggee is gone, so the
+            // routing loop would wait forever and Zed force-kills the adapter
+            // (the perceived "crash"). Own the shutdown instead: forward the
+            // request so a healthy lldb-dap still detaches, then leave the
+            // loop; teardown reaps lldb-dap within its budget (wait, then
+            // kill) and answers Zed. Its `simctl terminate` still runs unless
+            // the process actually exited (gated by debuggee_exited), so a
+            // detach here still terminates the app and we never step on a
+            // successor.
+            log::info!(
+                "{command} received (seq {seq}) after session end — shutting down, \
+                 answering after teardown"
+            );
+            let _ = self.send_to_child_raw(raw);
+            Ok(LoopAction::Exit(0))
+        } else {
+            // Live debuggee (no `exited`/`terminated` seen): forward so
+            // lldb-dap terminates/detaches per the request. Its answer is held
+            // (see `on_child_message`) and the loop ends there; teardown sends
+            // it once the critical work is done. Against the simulator
+            // debugserver lldb-dap can KILL the debuggee on disconnect and then
+            // wedge without answering (common when a concurrent Rerun's
+            // install is contending on the same bundle) — which would hang
+            // the loop until Zed force-kills the adapter. So arm a bounded
+            // wait: if lldb-dap has not answered by the deadline, we own the
+            // shutdown ourselves (the `stop_deadline` arm in the routing loop).
+            log::info!("{command} received (seq {seq}) — forwarding to lldb-dap (bounded)");
+            self.send_to_child_raw(raw)?;
+            self.stop_deadline = Some(Instant::now() + DISCONNECT_WEDGE_GRACE);
+            Ok(LoopAction::Continue)
         }
     }
 
@@ -530,20 +729,29 @@ impl Proxy {
 
         if self.mock_pipeline {
             log::info!("launch intercepted (seq {seq}): mock pipeline");
+            // The mock skips the build keys but keeps a scenario that parses,
+            // so `"oslog": true` starts the OSLog pump against the mock
+            // simulator (the smoke tests answer its `log stream`).
+            let config = serde_json::from_value::<LaunchConfig>(args).ok();
             tokio::spawn(async move {
                 let res = mock_pipeline(&sink, cancel)
                     .await
                     .map(|(app, child)| PipelineDone {
                         app,
-                        config: None,
+                        config,
                         mock_child: Some(child),
                     });
                 let _ = pipe_tx.send(res).await;
             });
         } else {
-            let cfg: LaunchConfig = match serde_json::from_value(args) {
+            let cfg: LaunchConfig = match serde_json::from_value(args.clone()) {
                 Ok(cfg) => cfg,
-                Err(e) => return self.fail_launch(&format!("invalid launch configuration: {e}")),
+                Err(e) => {
+                    return self.fail_launch(&format!(
+                        "invalid launch configuration: {}",
+                        config::invalid_config_reason(&args, &e)
+                    ))
+                }
             };
             // Raise (never lower) the log level for this session. Skipped
             // when init installed no logger — raising the level would only
@@ -562,10 +770,10 @@ impl Proxy {
                 log_frame("zed->proxy [replayed after verboseLogging raise]", raw);
             }
             log::info!(
-                "launch intercepted (seq {seq}): workspace {}, scheme {:?}, device {:?}, \
+                "launch intercepted (seq {seq}): workspace {:?}, scheme {:?}, device {:?}, \
                  os {:?}, configuration {:?}, preflight {}, oslog {}, buildOutput {:?}, \
                  terminateOnStop {}",
-                cfg.workspace.display(),
+                cfg.workspace,
                 cfg.scheme,
                 cfg.device,
                 cfg.os,
@@ -575,8 +783,14 @@ impl Proxy {
                 cfg.build_output,
                 cfg.terminate_on_stop,
             );
+            // Zed starts the adapter in the worktree root: the project root,
+            // whose selection store the pipeline reads on every launch.
+            let root = std::env::current_dir()
+                .map(|cwd| project::root_from_zed(&cwd))
+                .unwrap_or_else(|_| PathBuf::from("."));
+            let req = selection::Request::for_launch(&cfg, root);
             tokio::spawn(async move {
-                let res = pipeline::run_pipeline(&cfg, true, &sink, cancel)
+                let res = pipeline::run_pipeline(&req, true, &sink, cancel)
                     .await
                     .map(|app| PipelineDone {
                         app,
@@ -591,33 +805,26 @@ impl Proxy {
     }
 
     /// The pipeline task finished (success, failure, or cancellation).
-    async fn on_pipeline_result(&mut self, res: Result<PipelineDone>) -> Result<LoopAction> {
+    fn on_pipeline_result(&mut self, res: Result<PipelineDone>) -> Result<LoopAction> {
         self.pipeline_running = false;
         self.pipeline_cancel = None;
 
-        // A mid-pipeline disconnect cancelled us: answer the disconnect,
-        // emit `terminated`, clean up whatever was launched, exit 0.
-        if let Some(disc_seq) = self.pending_disconnect.take() {
-            if let Ok(mut done) = res {
-                // The pipeline won the race anyway — undo the launch. The app
-                // was launched `--wait-for-debugger` and never attached, so it
-                // is suspended and would hang forever if left: terminate it
-                // unconditionally (terminateOnStop only applies to an app that
-                // actually ran). Bounded so a wedged simctl can't stall exit.
-                if let Some(mut child) = done.mock_child.take() {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                } else {
-                    let _ = tokio::time::timeout(
-                        TEARDOWN_GRACE,
-                        simctl::terminate(&done.app.udid, &done.app.bundle_id),
-                    )
-                    .await;
-                }
+        // A mid-pipeline stop request cancelled us: leave the loop; teardown
+        // runs its critical part, then answers the request and emits
+        // `terminated`, and the adapter exits 0.
+        if let Some(stop) = self.stop.as_mut() {
+            stop.terminated_event = true;
+            let command = stop.command;
+            // The pipeline won the race anyway: hand the app to teardown,
+            // which undoes the launch. The app was launched
+            // `--wait-for-debugger` and never attached, so it is suspended and
+            // would hang forever if left; teardown terminates a never-attached
+            // app unconditionally (terminateOnStop only applies to an app that
+            // actually ran).
+            if let Ok(done) = res {
+                self.session = Some(done);
             }
-            log::info!("pipeline wound down after mid-build disconnect — exiting 0");
-            self.send_to_client(Out::Msg(peek::success_response(disc_seq, "disconnect")));
-            self.send_to_client(Out::Msg(peek::terminated_event()));
+            log::info!("pipeline wound down after a mid-build {command} — tearing down");
             return Ok(LoopAction::Exit(0));
         }
 
@@ -656,6 +863,7 @@ impl Proxy {
         self.attach_seq = Some(attach_seq);
         log::info!("attach requested (pid {pid}, seq {attach_seq})");
         self.send_to_child_msg(peek::attach_pid(pid, attach_seq))?;
+        self.attach_deadline = Some(Instant::now() + ATTACH_TIMEOUT);
 
         self.session = Some(done);
         Ok(LoopAction::Continue)
@@ -664,12 +872,65 @@ impl Proxy {
     /// Pipeline failure: error response + stderr output + `terminated`,
     /// then graceful exit 1 (teardown still flushes the writer).
     fn fail_launch(&mut self, msg: &str) -> Result<LoopAction> {
+        for out in self.launch_failure(msg) {
+            self.send_to_client(out);
+        }
+        Ok(LoopAction::Exit(1))
+    }
+
+    /// The frames that fail the client's launch: error response, stderr
+    /// output, `terminated`.
+    fn launch_failure(&self, msg: &str) -> Vec<Out> {
         log::error!("launch failed: {msg}");
         let seq = self.launch_seq.unwrap_or(0);
-        self.send_to_client(Out::Msg(peek::error_response(seq, "launch", msg)));
-        self.send_to_client(Out::Msg(peek::output_event("stderr", &format!("{msg}\n"))));
-        self.send_to_client(Out::Msg(peek::terminated_event()));
+        vec![
+            Out::Msg(peek::error_response(seq, "launch", msg)),
+            Out::Msg(peek::output_event("stderr", &format!("{msg}\n"))),
+            Out::Msg(peek::terminated_event()),
+        ]
+    }
+
+    /// lldb-dap did not answer the attach within [`ATTACH_TIMEOUT`]: fail the
+    /// launch, exit 1. The failure is held until teardown has terminated the
+    /// app, still suspended under `--wait-for-debugger` (never attached, so
+    /// regardless of `terminateOnStop`).
+    fn on_attach_timeout(&mut self) -> Result<LoopAction> {
+        let app = self
+            .session
+            .as_ref()
+            .map(|s| format!("{} (pid {})", s.app.bundle_id, s.app.pid))
+            .unwrap_or_else(|| "the app".to_string());
+        self.held_failure = self.launch_failure(&format!(
+            "the debugger did not attach to {app} within {}s — stopping the app, \
+             which was waiting for the debugger. Run again; if this repeats, \
+             `xcode-dap doctor` checks lldb-dap",
+            ATTACH_TIMEOUT.as_secs()
+        ));
         Ok(LoopAction::Exit(1))
+    }
+
+    /// The stop request's deadline passed with the routing loop still
+    /// running (it ends right after this). Either the pipeline it cancelled
+    /// has not wound down, or lldb-dap left the forwarded request
+    /// unanswered (teardown then kills it at once).
+    fn on_stop_deadline(&mut self) {
+        let Some((command, seq)) = self.stop.as_ref().map(|s| (s.command, s.seq)) else {
+            return;
+        };
+        if self.pipeline_running {
+            log::warn!(
+                "{command} (seq {seq}): the cancelled pipeline did not wind down within \
+                 {}s — tearing down without it",
+                PIPELINE_STOP_GRACE.as_secs()
+            );
+        } else {
+            self.lldb_wedged = true;
+            log::info!(
+                "{command} (seq {seq}): lldb-dap did not answer within {}s — owning the \
+                 shutdown",
+                DISCONNECT_WEDGE_GRACE.as_secs()
+            );
+        }
     }
 
     /// Route one frame arriving from lldb-dap.
@@ -678,6 +939,7 @@ impl Proxy {
         match peek::classify_child(raw)? {
             ChildMsg::InternalResponse { request_seq, raw } => {
                 if self.attach_seq == Some(request_seq) {
+                    self.attach_deadline = None;
                     // Rewrite the attach response into the client's launch
                     // response (request_seq -> launch seq, command ->
                     // "launch") and forward it.
@@ -706,8 +968,26 @@ impl Proxy {
                 Ok(LoopAction::Continue)
             }
             ChildMsg::Other { raw } => {
+                // lldb-dap's answer to a forwarded stop request is held, not
+                // passed on: teardown sends it once the critical work is done.
+                // (A mid-pipeline stop is never forwarded.)
+                if self.stop_deadline.is_some() && !self.pipeline_running {
+                    if let Some(stop) = self.stop.as_mut() {
+                        if peek::is_response_to(raw, stop.seq) {
+                            log::info!(
+                                "lldb-dap answered {} (seq {}) — holding the answer \
+                                 until teardown is done",
+                                stop.command,
+                                stop.seq
+                            );
+                            stop.response = Some(raw.to_vec());
+                            self.stop_deadline = None;
+                            return Ok(LoopAction::Exit(0));
+                        }
+                    }
+                }
                 // Track lldb-dap's end-of-session events so a following client
-                // `disconnect` is owned by us (see `on_client_message`).
+                // `disconnect` is owned by us (see `on_stop_request`).
                 // `exited` => the process is gone (also gates the teardown
                 // terminate-skip); a plain `terminated` is a detach — the app
                 // is still alive and must be terminated on Stop. `exited`
@@ -750,7 +1030,8 @@ impl Proxy {
             &session.app.stderr_file,
             sink.clone(),
         ));
-        // OSLog pump (§5.3): config is None in mock mode, so never here.
+        // OSLog pump (§5.3). In mock mode the "simulator" is `mock`, which only
+        // the smoke tests' stand-in `log stream` answers.
         if let Some(config) = session.config.as_ref().filter(|c| c.oslog) {
             let app_name = session
                 .app
@@ -837,11 +1118,18 @@ impl Proxy {
         !still_ours
     }
 
-    /// Clean teardown: wind down a still-running pipeline, stop + drain the
-    /// tailers, kill the mock dummy / `simctl terminate` the app, remove
-    /// the pidfile, close the child's stdin, kill lldb-dap if still alive,
-    /// then drain + flush the client writer so queued frames (e.g. the
-    /// disconnect response) reach Zed before exit.
+    /// Teardown, in three parts. First a pipeline still running is wound
+    /// down: on the EOF / SIGTERM paths nothing waits and it gets
+    /// [`PIPELINE_DRAIN_GRACE`]; with a stop request pending only what is
+    /// left of [`PIPELINE_STOP_GRACE`]. Then the critical part, bounded by
+    /// [`CRITICAL_TEARDOWN_BUDGET`] while a stop request waits: stop the
+    /// OSLog group, drain the console tailers one last time, kill the mock
+    /// app / `simctl terminate` the app, release the pidfile, reap lldb-dap.
+    /// It runs before a pending `disconnect` / `terminate` (or the attach
+    /// timeout's failure) is answered, because Zed kills the adapter as soon
+    /// as it has that answer and anything left for later would be orphaned.
+    /// Last, the answer goes out and the client writer is drained and
+    /// flushed so it reaches Zed before exit.
     async fn teardown(
         mut self,
         pipe_rx: &mut mpsc::Receiver<Result<PipelineDone>>,
@@ -849,30 +1137,54 @@ impl Proxy {
         client_writer: JoinHandle<()>,
         child_writer: JoinHandle<()>,
     ) {
+        let started = Instant::now();
         log::info!("teardown: begin");
-        // A pipeline cancelled here (EOF / SIGTERM paths) must finish its
-        // own cleanup (xcodebuild pgid kill) before we exit — kill_on_drop
-        // does not survive process exit.
+        // A pipeline still running here must finish its own cleanup
+        // (xcodebuild pgid kill) before we exit — kill_on_drop does not
+        // survive process exit. With a stop request pending, only within
+        // what is left of the stop's grace (see `pipeline_drain_grace`).
         if self.pipeline_running {
             log::info!("teardown: waiting for the cancelled pipeline to wind down");
             if let Some(cancel) = &self.pipeline_cancel {
                 cancel.cancel();
             }
-            if let Ok(Some(Ok(done))) =
-                tokio::time::timeout(PIPELINE_DRAIN_GRACE, pipe_rx.recv()).await
-            {
-                self.session = Some(done); // launched after all — clean it up below
+            if let Some(stop) = self.stop.as_mut() {
+                stop.terminated_event = true; // lldb-dap never had a session
+            }
+            let grace = pipeline_drain_grace(self.stop.as_ref().map(|s| s.received), started);
+            match tokio::time::timeout(grace, pipe_rx.recv()).await {
+                Ok(Some(Ok(done))) => self.session = Some(done), // launched after all — clean it up below
+                Ok(_) => {}
+                Err(_) => log::warn!(
+                    "teardown: the cancelled pipeline is still running after {} ms — \
+                     going on without it",
+                    grace.as_millis()
+                ),
             }
         }
 
+        // --- critical part: bounded, before the answer ----------------------
+        let budget = if self.stop.is_some() {
+            Budget::critical(Instant::now())
+        } else {
+            Budget::unhurried()
+        };
+
         // Final drain of app output while the client writer still runs.
         if let Some(oslog) = self.oslog.take() {
-            oslog.stop().await;
-            log::info!("teardown: oslog pump stopped");
+            if oslog.stop_within(budget.slice(OSLOG_STOP_GRACE)).await {
+                log::warn!(
+                    "teardown: oslog pump did not stop in time — SIGKILLed its process group"
+                );
+            } else {
+                log::info!("teardown: oslog pump stopped");
+            }
         }
         if let Some(tailers) = self.tailers.take() {
-            tailers.stop().await;
-            log::info!("teardown: tailers stopped");
+            match tokio::time::timeout(budget.slice(CONSOLE_DRAIN_GRACE), tailers.stop()).await {
+                Ok(()) => log::info!("teardown: tailers stopped"),
+                Err(_) => log::warn!("teardown: final console drain cut short"),
+            }
         }
 
         // Xcode Stop semantics: the app dies with the session — but only if
@@ -884,11 +1196,11 @@ impl Proxy {
         // here would hit the successor's app or nothing. Otherwise terminate
         // when terminateOnStop is set, or whenever we never attached (a
         // suspended `--wait-for-debugger` app must not be left frozen).
-        // Bounded so a wedged simctl can't stall exit.
+        // Bounded so a wedged simctl can't stall the answer.
         if let Some(mut done) = self.session.take() {
             if let Some(mut child) = done.mock_child.take() {
                 let _ = child.start_kill();
-                let _ = child.wait().await;
+                let _ = tokio::time::timeout(FORCED_REAP_GRACE, child.wait()).await;
                 log::info!("teardown: mock app killed");
             } else {
                 let terminate_on_stop = done.config.as_ref().is_some_and(|c| c.terminate_on_stop);
@@ -903,11 +1215,13 @@ impl Proxy {
                         done.app.bundle_id,
                         done.app.udid
                     );
-                    let _ = tokio::time::timeout(
-                        TEARDOWN_GRACE,
-                        simctl::terminate(&done.app.udid, &done.app.bundle_id),
-                    )
-                    .await;
+                    let terminate = simctl::terminate(&done.app.udid, &done.app.bundle_id);
+                    if tokio::time::timeout(budget.slice(TEARDOWN_GRACE), terminate)
+                        .await
+                        .is_err()
+                    {
+                        log::warn!("teardown: simctl terminate did not finish in time");
+                    }
                 }
             }
         }
@@ -920,27 +1234,57 @@ impl Proxy {
         // Closing the channel ends the writer task, dropping ChildStdin
         // (lldb-dap sees stdin EOF and exits on its own in the normal path).
         drop(self.to_child.take());
-        let _ = tokio::time::timeout(TEARDOWN_GRACE, child_writer).await;
+        let _ = tokio::time::timeout(budget.slice(TEARDOWN_GRACE), child_writer).await;
         log::info!("teardown: lldb-dap stdin closed");
 
         if let Some(mut lldb) = self.lldb.take() {
-            match tokio::time::timeout(TEARDOWN_GRACE, lldb.child.wait()).await {
+            let grace = if self.lldb_wedged {
+                Duration::ZERO // it already ignored the stop request
+            } else {
+                budget.slice(TEARDOWN_GRACE)
+            };
+            match tokio::time::timeout(grace, lldb.child.wait()).await {
                 Ok(_) => log::info!("teardown: lldb-dap exited"),
                 Err(_) => {
-                    // Still alive after grace period — kill (kill_on_drop
-                    // also covers panics/early returns).
-                    log::warn!("teardown: lldb-dap still alive after grace period — killing");
+                    // Still alive at the deadline (or wedged) — kill
+                    // (kill_on_drop also covers panics/early returns).
+                    if self.lldb_wedged {
+                        log::warn!("teardown: lldb-dap left the stop request unanswered — killing");
+                    } else {
+                        log::warn!("teardown: lldb-dap still alive at the deadline — killing");
+                    }
                     let _ = lldb.child.start_kill();
-                    let _ = lldb.child.wait().await;
+                    let _ = tokio::time::timeout(FORCED_REAP_GRACE, lldb.child.wait()).await;
                 }
             }
         }
-        let _ = tokio::time::timeout(TEARDOWN_GRACE, child_reader).await;
+        // The reader only forwards lldb-dap frames nobody reads any more.
+        child_reader.abort();
+        log::info!("teardown: done in {} ms", started.elapsed().as_millis());
 
+        // --- the answer, then the flush ----------------------------------------
+        if !self.held_failure.is_empty() {
+            log::info!(
+                "launch (seq {}): failure answered after teardown",
+                self.launch_seq.unwrap_or(0)
+            );
+            for out in std::mem::take(&mut self.held_failure) {
+                self.send_to_client(out);
+            }
+        }
+        if let Some(stop) = self.stop.take() {
+            log::info!(
+                "{} (seq {}): answered after teardown",
+                stop.command,
+                stop.seq
+            );
+            for out in stop.answers() {
+                self.send_to_client(out);
+            }
+        }
         // Drain whatever is still queued for Zed, then flush.
         drop(self.to_client);
         let _ = tokio::time::timeout(TEARDOWN_GRACE, client_writer).await;
-        log::info!("teardown: done");
     }
 }
 
@@ -996,7 +1340,11 @@ async fn mock_pipeline(
         .await
         .context("writing mock_app.c")?;
     let mut cc = Command::new("cc");
-    cc.arg("-o").arg(&exe).arg(&src).kill_on_drop(true);
+    cc.arg("-o")
+        .arg(&exe)
+        .arg(&src)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
     let out = tokio::select! {
         out = cc.output() => out.context("running cc")?,
         _ = cancel.cancelled() => bail!("cancelled"),
@@ -1068,7 +1416,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::should_terminate_on_teardown;
+    use super::*;
 
     #[test]
     fn terminates_attached_app_with_terminate_on_stop() {
@@ -1106,5 +1454,170 @@ mod tests {
         assert!(!should_terminate_on_teardown(true, true, false, true));
         assert!(!should_terminate_on_teardown(true, false, false, true));
         assert!(!should_terminate_on_teardown(false, false, false, true));
+    }
+
+    #[test]
+    fn budget_slice_is_capped_by_the_step() {
+        let now = Instant::now();
+        let budget = Budget::critical(now);
+        assert_eq!(budget.slice_at(now, OSLOG_STOP_GRACE), OSLOG_STOP_GRACE);
+    }
+
+    #[test]
+    fn budget_slice_shrinks_to_what_is_left() {
+        let now = Instant::now();
+        let budget = Budget::critical(now);
+        let later = now + graceful_budget() - Duration::from_millis(200);
+        assert_eq!(
+            budget.slice_at(later, TEARDOWN_GRACE),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn budget_slice_is_zero_once_spent() {
+        let now = Instant::now();
+        let budget = Budget::critical(now);
+        assert_eq!(
+            budget.slice_at(now + graceful_budget(), TEARDOWN_GRACE),
+            Duration::ZERO
+        );
+        assert_eq!(
+            budget.slice_at(now + Duration::from_secs(60), TEARDOWN_GRACE),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn worst_case_teardown_stays_within_the_critical_budget() {
+        // Every step uses its whole slice, in teardown order: OSLog group,
+        // console drain, simctl terminate, lldb-dap stdin flush, lldb-dap
+        // exit. The graceful waits never exceed the shared budget, and with
+        // every forced reap on top the hold stays within the critical budget.
+        let start = Instant::now();
+        let budget = Budget::critical(start);
+        let mut now = start;
+        for cap in [
+            OSLOG_STOP_GRACE,
+            CONSOLE_DRAIN_GRACE,
+            TEARDOWN_GRACE,
+            TEARDOWN_GRACE,
+            TEARDOWN_GRACE,
+        ] {
+            now += budget.slice_at(now, cap);
+        }
+        let graceful = now - start;
+        assert!(graceful <= graceful_budget(), "{graceful:?}");
+        assert!(graceful + FORCED_REAP_GRACE * FORCED_REAPS <= CRITICAL_TEARDOWN_BUDGET);
+    }
+
+    #[test]
+    fn critical_budget_leaves_room_after_the_capped_steps() {
+        // The capped steps (OSLog stop, console drain) must leave time for
+        // the app terminate and the lldb-dap reap after them.
+        assert_eq!(
+            graceful_budget() + FORCED_REAP_GRACE * FORCED_REAPS,
+            CRITICAL_TEARDOWN_BUDGET
+        );
+        assert!(OSLOG_STOP_GRACE + CONSOLE_DRAIN_GRACE < graceful_budget());
+    }
+
+    #[test]
+    fn unhurried_budget_gives_every_step_the_full_grace() {
+        // No answer waits (SIGTERM, EOF, attach timeout): the app terminate
+        // must not get only what the OSLog stop and the drain left over.
+        let now = Instant::now();
+        let budget = Budget::unhurried();
+        assert_eq!(budget.slice_at(now, OSLOG_STOP_GRACE), TEARDOWN_GRACE);
+        assert_eq!(
+            budget.slice_at(now + Duration::from_secs(60), TEARDOWN_GRACE),
+            TEARDOWN_GRACE
+        );
+    }
+
+    #[test]
+    fn pipeline_drain_without_a_stop_covers_the_build_escalation() {
+        // EOF / SIGTERM mid-build: nothing waits, so the build gets its full
+        // SIGTERM -> 3 s -> SIGKILL escalation.
+        let now = Instant::now();
+        assert_eq!(pipeline_drain_grace(None, now), PIPELINE_DRAIN_GRACE);
+        assert!(PIPELINE_DRAIN_GRACE > Duration::from_secs(3));
+    }
+
+    #[test]
+    fn pipeline_drain_with_a_stop_takes_only_what_is_left_of_its_grace() {
+        let received = Instant::now();
+        assert_eq!(
+            pipeline_drain_grace(Some(received), received),
+            PIPELINE_STOP_GRACE
+        );
+        assert_eq!(
+            pipeline_drain_grace(Some(received), received + Duration::from_secs(1)),
+            PIPELINE_STOP_GRACE - Duration::from_secs(1)
+        );
+        // The routing loop already waited the whole grace (a hung step):
+        // teardown does not wait again.
+        assert_eq!(
+            pipeline_drain_grace(Some(received), received + PIPELINE_STOP_GRACE),
+            Duration::ZERO
+        );
+        assert_eq!(
+            pipeline_drain_grace(Some(received), received + Duration::from_secs(60)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn stop_grace_covers_the_cancel_cleanup_and_stays_short() {
+        // Long enough for xcodebuild's (and the preflight's) SIGTERM -> 3 s
+        // -> SIGKILL, so a normal cancel never hits it; short enough that a
+        // mid-pipeline Stop, critical teardown included, is answered within
+        // 6 s however long the cancelled step hangs.
+        assert!(PIPELINE_STOP_GRACE > Duration::from_secs(3));
+        assert!(PIPELINE_STOP_GRACE + CRITICAL_TEARDOWN_BUDGET <= Duration::from_secs(6));
+    }
+
+    fn message(out: &Out) -> Value {
+        match out {
+            Out::Msg(v) => v.clone(),
+            Out::Raw(raw) => serde_json::from_slice(raw).unwrap(),
+        }
+    }
+
+    #[test]
+    fn own_answer_is_a_bare_success_for_the_request() {
+        let answers = StopRequest::new(7, "terminate").answers();
+        assert_eq!(answers.len(), 1);
+        let msg = message(&answers[0]);
+        assert_eq!(msg["type"], "response");
+        assert_eq!(msg["request_seq"], 7);
+        assert_eq!(msg["command"], "terminate");
+        assert_eq!(msg["success"], true);
+    }
+
+    #[test]
+    fn lldb_dap_answer_is_passed_on_verbatim() {
+        let raw = br#"{"seq":31,"type":"response","request_seq":7,"command":"disconnect","success":true}"#;
+        let mut stop = StopRequest::new(7, "disconnect");
+        stop.response = Some(raw.to_vec());
+        let answers = stop.answers();
+        assert_eq!(answers.len(), 1);
+        match &answers[0] {
+            Out::Raw(bytes) => assert_eq!(bytes.as_slice(), raw.as_slice()),
+            Out::Msg(_) => panic!("expected the held bytes"),
+        }
+    }
+
+    #[test]
+    fn cancelled_pipeline_answer_is_followed_by_terminated() {
+        let mut stop = StopRequest::new(5, "disconnect");
+        stop.terminated_event = true;
+        stop.repeats.push((6, "disconnect"));
+        let answers: Vec<Value> = stop.answers().iter().map(message).collect();
+        assert_eq!(answers.len(), 3);
+        assert_eq!(answers[0]["request_seq"], 5);
+        assert_eq!(answers[1]["request_seq"], 6);
+        assert_eq!(answers[1]["success"], true);
+        assert_eq!(answers[2]["event"], "terminated");
     }
 }

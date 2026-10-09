@@ -3,15 +3,15 @@
   "title": "Xcode debug adapter configuration",
   "description": "Scenario config for the `Xcode` adapter (ZedXcode). Mirrors `LaunchConfig` in crates/xcode-dap-config; consumed by the `xcode-dap` proxy as the DAP `launch` request arguments.",
   "type": "object",
-  "required": ["workspace", "scheme"],
+  "required": [],
   "properties": {
     "workspace": {
       "type": "string",
-      "description": "Path to the .xcworkspace (or .xcodeproj) to build, e.g. \"$ZED_WORKTREE_ROOT/MyApp.xcworkspace\". Zed task variables are substituted before launch."
+      "description": "Path to the .xcworkspace (or .xcodeproj) to build, e.g. \"$ZED_WORKTREE_ROOT/MyApp.xcworkspace\". Zed task variables are substituted before launch. If omitted, the workspace or project found in the project folder (up to two levels deep) is used."
     },
     "scheme": {
       "type": "string",
-      "description": "Xcode scheme to build and run, e.g. \"MyApp\"."
+      "description": "Xcode scheme to build and run, e.g. \"MyApp\". Used only when no scheme is chosen with Xcode: Choose Scheme; if omitted, the container's only scheme is used."
     },
     "device": {
       "type": "string",

@@ -17,6 +17,9 @@
 //! - [`ingest`] runs the cold-start bootstrap + poll loop that keeps the
 //!   store fresh and pushes `buildTarget/didChange` when it changes.
 
+// BSP mode's stdout carries only framed JSON-RPC: no `print!` / `println!`.
+#![deny(clippy::print_stdout)]
+
 mod ingest;
 mod server;
 

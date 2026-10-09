@@ -79,6 +79,7 @@ fn pid_is_xcode_dap(pid: i32) -> bool {
 /// Executable path of a live pid via `proc_pidpath(2)`; `None` when the
 /// process is gone or the path is unreadable. Works without privilege for
 /// same-user pids, which is all a proxy ever writes into a pidfile.
+#[cfg(target_os = "macos")]
 fn proc_exe_path(pid: i32) -> Option<PathBuf> {
     let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: proc_pidpath writes at most buf.len() bytes and returns the
@@ -90,6 +91,13 @@ fn proc_exe_path(pid: i32) -> Option<PathBuf> {
     }
     let path = std::str::from_utf8(&buf[..len as usize]).ok()?;
     Some(PathBuf::from(path))
+}
+
+/// Non-macOS builds exist only so the unit tests run on any host; the
+/// product itself is macOS-only.
+#[cfg(not(target_os = "macos"))]
+fn proc_exe_path(pid: i32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
 /// The proxy binary is named `xcode-dap` (its Cargo bin name); match its

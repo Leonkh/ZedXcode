@@ -1,0 +1,210 @@
+# Continuous integration: the full gate on every push and pull request.
+#
+#   gate            scripts/gate.sh, the same check contributors run locally
+#   extension-msrv  the extension still builds with Rust 1.90, the toolchain
+#                   Zed's extension registry builds with
+#   fixtures        `xcode-dap build` on MyApp and on every layout fixture
+#                   that holds an Xcode container
+#
+# Third-party actions are pinned to a full commit SHA (the tag is in the
+# trailing comment).
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer run for the same ref (a branch push, a pull request update)
+# cancels the one still in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# bash with -e and -o pipefail for every step (the implicit default has no
+# pipefail).
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  gate:
+    name: Gate
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.96.0
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal -c rustfmt,clippy -t wasm32-wasip2
+          rustup default 1.96.0
+
+      - name: Show the toolchain
+        run: |
+          rustc --version
+          cargo --version
+          xcodebuild -version
+          xcrun --find lldb-dap
+          python3 --version
+
+      # The mock DAP session attaches lldb-dap to a local process; a hosted
+      # runner allows that only with developer mode on.
+      - name: Allow the debugger to attach
+        run: sudo DevToolsSecurity -enable
+
+      - name: Gate
+        run: scripts/gate.sh
+
+  extension-msrv:
+    name: Extension on Rust 1.90
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.90.0
+        run: rustup toolchain install 1.90.0 --profile minimal -t wasm32-wasip2
+
+      - name: Check the extension
+        working-directory: extension
+        run: cargo +1.90.0 check --target wasm32-wasip2 --locked
+
+  fixtures:
+    name: Fixture builds
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The job only builds xcode-dap: no rustfmt, clippy or wasm target.
+      - name: Install Rust 1.96.0
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+
+      - name: Show the toolchain
+        run: |
+          rustc --version
+          xcodebuild -version
+
+      - name: Build xcode-dap
+        run: cargo build --locked
+
+      - name: Build the fixtures with xcode-dap
+        run: |
+          set -euo pipefail
+          bin="$GITHUB_WORKSPACE/target/debug/xcode-dap"
+          work="$RUNNER_TEMP/fixtures"
+          rm -rf "$work"
+          mkdir -p "$work"
+          # Builds and the fake generator run on a copy, so nothing is
+          # written into the checkout.
+          cp -R tests/fixtures/. "$work/"
+
+          # Build for an iPhone on the selected Xcode's own simulator runtime
+          # (its iphonesimulator SDK version) when one is available. Left to
+          # itself, xcode-dap takes the newest iPhone across every installed
+          # runtime, and the image may carry the runtimes of newer Xcodes
+          # (betas among them), which the selected Xcode cannot build for.
+          # The check uses the filters of xcode-dap's own device choice.
+          os_args=()
+          sdk="$(xcrun --sdk iphonesimulator --show-sdk-version | cut -d. -f1-2)"
+          if xcrun simctl list --json devices | python3 -c '
+          import json, sys
+          suffix = "iOS-" + sys.argv[1].replace(".", "-")
+          devices = json.load(sys.stdin).get("devices", {})
+          sys.exit(0 if any(
+              "SimRuntime.iOS" in runtime and runtime.endswith(suffix)
+              and any(d.get("isAvailable") and str(d.get("name", "")).startswith("iPhone")
+                      for d in devs)
+              for runtime, devs in devices.items()) else 1)
+          ' "$sdk"; then
+            os_args=(--os "$sdk")
+            echo "simulator: an iPhone on iOS $sdk (the selected Xcode's SDK)"
+          else
+            echo "simulator: no available iPhone on iOS $sdk (the selected Xcode's SDK); xcode-dap picks one"
+          fi
+
+          # Xcode containers below a directory (an .xcodeproj's inner
+          # project.xcworkspace is not one of its own).
+          containers() {
+            find "$1" \( -name '*.xcodeproj' -o -name '*.xcworkspace' \) -prune -print
+          }
+
+          failed=""
+          # build_fixture <name> <container, relative to the copy>
+          build_fixture() {
+            local name="$1" container="$work/$2" code=0
+            echo "::group::xcode-dap build $2"
+            # A failure before the build must not show an older build's output.
+            rm -f "$HOME/.zedxcode/logs/build-latest.log"
+            # ${os_args[@]+...}: an empty array under `set -u` is an error in
+            # bash 3.2.
+            "$bin" build -w "$container" -s MyApp ${os_args[@]+"${os_args[@]}"} || code=$?
+            echo "::endgroup::"
+            if [[ $code -eq 0 ]]; then
+              echo "ok: $name builds ($2)"
+            else
+              echo "::error::xcode-dap build failed for $name ($2, exit $code)"
+              if [[ -f "$HOME/.zedxcode/logs/build-latest.log" ]]; then
+                echo "--- xcodebuild output (last 60 lines) ---"
+                tail -n 60 "$HOME/.zedxcode/logs/build-latest.log"
+              fi
+              failed="$failed $name"
+            fi
+          }
+
+          build_fixture myapp myapp/MyApp.xcodeproj
+          build_fixture xcworkspace layouts/xcworkspace/MyApp.xcworkspace
+          build_fixture nested-ios layouts/nested-ios/ios/MyApp.xcworkspace
+          build_fixture tuist-shaped layouts/tuist-shaped/MyApp.xcworkspace
+          build_fixture local-package layouts/local-package/MyApp.xcworkspace
+
+          # Not generated yet: no container until its generator has run.
+          ungenerated="$work/layouts/xcodegen-ungenerated"
+          if [[ -n "$(containers "$ungenerated")" ]]; then
+            echo "::error::xcodegen-ungenerated holds a container before generate.sh ran"
+            failed="$failed xcodegen-ungenerated"
+          elif "$ungenerated/generate.sh"; then
+            build_fixture xcodegen-ungenerated layouts/xcodegen-ungenerated/MyApp.xcodeproj
+          else
+            echo "::error::xcodegen-ungenerated: generate.sh failed"
+            failed="$failed xcodegen-ungenerated"
+          fi
+
+          # The negative case: a Swift package with no Xcode container.
+          found="$(containers "$work/layouts/spm-only")"
+          if [[ -n "$found" ]]; then
+            echo "::error::spm-only must hold no Xcode container, found: $found"
+            failed="$failed spm-only"
+          else
+            echo "ok: spm-only holds no Xcode container"
+          fi
+
+          if [[ -n "$failed" ]]; then
+            echo "::error::fixture checks failed:$failed"
+            exit 1
+          fi
+
+      - name: Show the xcode-dap log
+        if: failure()
+        run: |
+          log="$HOME/.zedxcode/logs/xcode-dap.log"
+          if [[ -f "$log" ]]; then
+            tail -n 200 "$log"
+          else
+            echo "no $log"
+          fi

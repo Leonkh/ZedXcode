@@ -1,0 +1,28 @@
+# Allowed direct dependencies of every Cargo manifest in this repository.
+#
+# scripts/check-deps.sh compares this list with `cargo metadata` for the
+# workspace and for extension/, and fails on any difference in either
+# direction. Any edit to this file, including adding a crate, needs the
+# maintainer's sign-off in the pull request.
+#
+# One entry per line: <manifest directory> <kind> <package name>
+#   kind: normal, dev or build (a target-specific dependency counts under its
+#   kind); package name: the crate's name on crates.io or its path package,
+#   not a `package = ...` rename.
+
+crates/xcode-dap normal anyhow
+crates/xcode-dap normal clap
+crates/xcode-dap normal flate2
+crates/xcode-dap normal libc
+crates/xcode-dap normal log
+crates/xcode-dap normal serde
+crates/xcode-dap normal serde_json
+crates/xcode-dap normal tokio
+crates/xcode-dap normal tokio-util
+crates/xcode-dap normal xcode-dap-config
+
+crates/xcode-dap-config normal serde
+
+extension normal serde_json
+extension normal xcode-dap-config
+extension normal zed_extension_api

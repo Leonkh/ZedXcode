@@ -44,12 +44,15 @@ ZedXcode/
 │       ├── engine/
 │       │   ├── config.rs           # LaunchConfig re-export (schema lives in crates/xcode-dap-config)
 │       │   ├── pipeline.rs         # preflight→buildServer→build→install→launch→pid→ingest (shared by dap + CLI)
+│       │   ├── project.rs          # project root, container and generator discovery (two levels deep), git worktree info
 │       │   ├── xcodebuild.rs       # build/clean/showBuildSettings, output filter/throttle
-│       │   ├── simctl.rs           # device resolution, boot, install, launch, terminate, pid fallback
+│       │   ├── schemes.rs          # schemes + configurations via `xcodebuild -list -json`, cached on every xcschemes/ mtime
+│       │   ├── destinations.rs     # one simulator inventory, destination resolution (UDID first, lenient OS), the automatic rule
+│       │   ├── simctl.rs           # device list, boot, install, launch, terminate, pid fallback
 │       │   ├── consoles.rs         # stdout/stderr file tailers, optional oslog pump
 │       │   ├── compile_store.rs    # persistent per-(build_root,scheme) compile-args store (bsp)
 │       │   ├── xcactivitylog.rs    # parse Xcode's .xcactivitylog build logs into compile args
-│       │   └── selection.rs        # .zed/.zedx/selection.json scheme/device overlay
+│       │   └── selection.rs        # selection store v2 (.zed/.zedx/selection.json) + resolve(): flags, store, main checkout's store, scenario keys, automatic
 │       ├── bsp/
 │       │   ├── mod.rs
 │       │   ├── server.rs           # sourcekit-lsp Build Server (`xcode-dap bsp`)
@@ -108,7 +111,7 @@ Passthrough must be **byte-transparent**: a typed decode→re-encode roundtrip r
 pub enum ClientMsg<'a> {
     Initialize { raw: &'a [u8] },
     Launch     { seq: i64, args: serde_json::Value },   // OUR scenario config
-    Disconnect { raw: &'a [u8] },
+    Disconnect { seq: i64, command: &'static str, raw: &'a [u8] },  // disconnect or terminate
     Other      { raw: &'a [u8] },
 }
 pub enum ChildMsg<'a> {
@@ -167,9 +170,11 @@ app stdout/stderr tailers ─▶ output events (category "stdout"/"stderr"), int
 
 **Other states:**
 - *Init guard*: if no `initialize` arrives within 2 s of entering dap mode, print "Running in DAP mode but initialize not received — did you mean a subcommand? Try --help" and exit 1 (great accidental-invocation UX).
-- *Disconnect/Stop*: forward `disconnect` to lldb-dap; lldb-dap's `terminate`/`disconnect(terminateDebuggee)` handling kills or detaches per Zed's request. The forward is **bounded** (`DISCONNECT_WEDGE_GRACE`, a few seconds): against the simulator debugserver lldb-dap can kill its debuggee on disconnect and then **wedge without exiting** — especially while a concurrent Rerun's `simctl install` contends on the same bundle — which would hang the routing loop until Zed force-kills the adapter (the perceived crash). If lldb-dap has not exited by the deadline, the proxy answers the disconnect itself and shuts down. After lldb-dap exits (or on our own teardown), belt-and-braces: `xcrun simctl terminate <udid> <bundleId>` (ignore failure) — mirrors Xcode's Stop semantics; config flag `"terminateOnStop": true` (default).
-- *Disconnect after lldb-dap ended the session*: if an `exited`/`terminated` event was seen **before** the disconnect — e.g. a second run's `simctl install` replaced the running app's bundle, killing it, and lldb-dap's `terminated` is what made Zed disconnect — the proxy does **not** forward-and-wait for lldb-dap to exit. Against the simulator debugserver lldb-dap can wedge on a disconnect once its debuggee is gone, so the routing loop would wait forever for an exit that never arrives and Zed force-kills the adapter (perceived as a crash, with no teardown logged). Instead the proxy answers the disconnect itself and exits 0 — teardown's bounded lldb-dap wait-then-kill reaps a wedged child. The belt-and-braces `simctl terminate` is skipped **only** when an `exited` event proved the process is gone (so we never step on a successor's freshly launched app). A plain `terminated` is a *detach*, not a kill — lldb-dap detaches an attach-by-pid session on disconnect (ignoring `terminateDebuggee`), leaving the app alive — so that path (and every ordinary Stop) still terminates the app per `terminateOnStop`.
-- *Stop mid-build*: `select!` in pipeline races build vs client messages; on `disconnect` → kill xcodebuild **process group** (spawn with `setpgid`, kill `-pgid` so `swift-frontend` children die too), respond success to disconnect, `terminated_event()`, exit 0.
+- *Stop answers last*: Zed waits for the answer to its `disconnect` with no timeout and kills the adapter as soon as the answer arrives, so whatever the adapter still has to do after answering is cut off — the app, lldb-dap and the OSLog `log stream` (its own process group) survive and the pidfile stays. Every Stop path therefore runs a **critical teardown before the answer goes out**, bounded to 2 s in total (`CRITICAL_TEARDOWN_BUDGET`): stop the OSLog group (SIGKILL after 500 ms), drain the console tailers one last time, `simctl terminate` the app per `terminateOnStop`, release the pidfile, reap lldb-dap (wait, then kill at the deadline). The graceful waits share one deadline; each step's forced fallback (SIGKILL and a short reap) sits outside it, which keeps the sum within the budget. `teardown: done` is logged before the answer, then `disconnect (seq N): answered after teardown`. The shared deadline applies only while a stop request waits; on the other paths (SIGTERM, stdin EOF, lldb-dap exit, attach timeout) each wait gets the whole `TEARDOWN_GRACE`, so a slow `simctl terminate` is not cut short. Known residual: the in-simulator `log` process that `simctl spawn` starts is not in the host process group, so when the OSLog stop has to SIGKILL the group (SIGTERM unanswered after 500 ms), that process can outlive the session until it next fails to write. A `terminate` request (sent by Zed instead of `disconnect` when the adapter advertises `supportsTerminateRequest`) is handled exactly like `disconnect`.
+- *Disconnect/Stop*: forward `disconnect` to lldb-dap; lldb-dap's `disconnect(terminateDebuggee)` handling kills or detaches per Zed's request. Its answer is **held**: the routing loop ends there, and teardown passes it on verbatim after the critical part. The forward is **bounded** (`DISCONNECT_WEDGE_GRACE`, a few seconds): against the simulator debugserver lldb-dap can kill its debuggee on disconnect and then **wedge without answering or exiting** — especially while a concurrent Rerun's `simctl install` contends on the same bundle — which would hang the routing loop until Zed force-kills the adapter (the perceived crash). If lldb-dap has not answered by the deadline, the proxy owns the shutdown and teardown answers the disconnect itself. Teardown's `xcrun simctl terminate <udid> <bundleId>` (ignore failure) mirrors Xcode's Stop semantics; config flag `"terminateOnStop": true` (default).
+- *Disconnect after lldb-dap ended the session*: if an `exited`/`terminated` event was seen **before** the disconnect — e.g. a second run's `simctl install` replaced the running app's bundle, killing it, and lldb-dap's `terminated` is what made Zed disconnect — the proxy does **not** forward-and-wait for lldb-dap. Against the simulator debugserver lldb-dap can wedge on a disconnect once its debuggee is gone, so the routing loop would wait forever for an answer that never arrives and Zed force-kills the adapter (perceived as a crash, with no teardown logged). Instead the proxy forwards the disconnect (a healthy lldb-dap still detaches), leaves the loop, and answers after the critical teardown — whose bounded lldb-dap wait-then-kill reaps a wedged child — then exits 0. The `simctl terminate` is skipped **only** when an `exited` event proved the process is gone (so we never step on a successor's freshly launched app). A plain `terminated` is a *detach*, not a kill — lldb-dap detaches an attach-by-pid session on disconnect (ignoring `terminateDebuggee`), leaving the app alive — so that path (and every ordinary Stop) still terminates the app per `terminateOnStop`.
+- *Stop mid-build*: `select!` in pipeline races build vs client messages; on `disconnect` → kill xcodebuild **process group** (spawn with `setpgid`, kill `-pgid` so `swift-frontend` children die too); resolving the simulator, locating the app, reading the bundle id, `simctl install` and `simctl launch` race the cancel token as well (the helper is dropped, which kills it), with a re-check right after install. A cancelled launch gets 1 s to finish (killing the `simctl launch` client does not withdraw a launch the simulator already accepted), then up to 2 s to terminate the app it may have started suspended. Once the pipeline has wound down — or after `PIPELINE_STOP_GRACE` (4 s from the disconnect) if a step ignores the cancel — critical teardown, then a success answer to the disconnect and `terminated_event()`, exit 0. A mid-build Stop is therefore answered within 6 s.
+- *Attach timeout*: lldb-dap gets 30 s (`ATTACH_TIMEOUT`) to answer the attach. Past that the launch fails: teardown first terminates the app, which is still suspended under `--wait-for-debugger`, then the launch is answered with an error (followed by `terminated`), so a client that ends the adapter on that answer cannot cut the terminate off.
 - *lldb-dap exits* → exit (Zed usually kills us first).
 - *stdin EOF* → cleanup, exit 0. *SIGTERM/SIGINT* (tokio::signal) → **emit a `terminated` event first when a session is active** (`announce_superseded`), so the adapter's exit reads as a clean session end rather than a crash, then the same cleanup path — which terminates our still-owned app, unblocking a superseding run's install. Cleanup = kill children (`kill_on_drop` + explicit pgid kills), drop tailers, remove pidfile.
 - *Pidfile / supersede*: ownership is claimed **after a successful pipeline run** (post device-resolution — the udid is not known at launch-intercept): read `~/.zedxcode/run/sim-<udid>.pid`, SIGTERM a stale previous instance, write own pid; removed on teardown. Additionally, in DAP mode a **pre-install SIGTERM** goes to the predecessor right after a successful build and **before `simctl install`** (via `pidfile::kill_old`, which signals **without** taking ownership): on the simulator `install` *blocks* while a previous session's app is still running under lldb (it does not replace or kill it — empirically it stalls until that app dies), so a Rerun would otherwise hang for as long as the old app lives. Because the early signal does not write our pid, the predecessor still owns the pidfile when it tears down (`superseded() == false`) and therefore terminates **its own** app, unblocking our install; the post-launch ownership still guards a launched successor's app from a late predecessor teardown (the 2026-07-16 audit invariant).
@@ -178,8 +183,8 @@ app stdout/stderr tailers ─▶ output events (category "stdout"/"stderr"), int
 
 ```rust
 pub struct LaunchConfig {              // = flattened scenario `config` from Zed
-    pub workspace: PathBuf,            // YourApp.xcworkspace (or project)
-    pub scheme: String,                // "YourApp"
+    pub workspace: Option<PathBuf>,    // YourApp.xcworkspace (or project); None = found two levels deep
+    pub scheme: Option<String>,        // legacy "YourApp", below the selection store; None = the only scheme
     pub device: Option<String>,        // "iPhone 15 Pro Max" | udid; None = booted iPhone, else newest available
     pub os: Option<String>,            // "26.3" — optional narrowing
     pub configuration: Option<String>,
@@ -195,13 +200,13 @@ pub async fn run_pipeline(cfg: &LaunchConfig, sink: &dyn OutputSink, cancel: Can
 `OutputSink` abstracts "where lines go": dap mode → output events; CLI mode → plain stderr/stdout. Phases (each line below is an existing verified mechanic, now codified):
 
 1. **Preflight**: if workspace missing and `preflight` set → run it (for a Tuist-generated project this is the project-generation command, e.g. `make project CI=true`; setup writes it; the binary itself never invents one).
-2. **Resolve simulator** (`simctl.rs`): `xcrun simctl list devices --json`; match by udid-or-name (+ optional OS runtime match); prefer `Booted`; ambiguity → deterministic sort. Not booted → `xcrun simctl boot <udid>` (tolerant of "already booted/booting", retrying a "Shutting Down" race) → `open -a Simulator` (visible window) → `xcrun simctl bootstatus <udid>` (blocks until ready; **no `-b`** — booting via Simulator.app first plus a `bootstatus -b` inner boot fails with SimError 405).
+2. **Resolve simulator** (`simctl.rs`): `xcrun simctl list devices --json`; match by udid-or-name (+ optional OS runtime match); prefer `Booted`; ambiguity → deterministic sort. Not booted → `xcrun simctl boot <udid>` (tolerant of "already booted/booting", retrying a "Shutting Down" race) → the simulator window, concurrently with `xcrun simctl bootstatus <udid>` (blocks until ready; **no `-b`** — a window opened before `simctl boot` boots the device too, and a `bootstatus -b` inner boot then fails with SimError 405): `open` on the first app that exists of `<dev>/Applications/Simulator.app` (Xcode 26) and `<dev>/../Applications/DeviceHub.app` (Xcode 27), else `open -a Simulator`, where `<dev>` is `DEVELOPER_DIR` or `xcode-select -p`; each `open` gets 60 s (a first launch inside a freshly installed Xcode can be that slow), a timeout stops the chain (the app is probably still starting), and a window that does not open is a warning and one console line, never fatal (the simulator runs headless). Deadlines: `simctl list` 30 s, the boot phase 240 s, `-showBuildSettings` 120 s, `simctl install` 300 s, `simctl launch` 60 s; the process is killed and the error names the step and its fix. After a simctl deadline, `xcodebuild -checkFirstLaunchStatus` runs; a non-zero exit adds the `xcodebuild -runFirstLaunch` hint.
 2a. **Ensure build server** (`ensure_build_server`, opt-in-gated): when `buildServer.json` under the workspace parent is stale/missing, regenerate it (may print the `editor: restart language server` hint). See [`bsp-server.md`](bsp-server.md).
 3. **Build** (`xcodebuild.rs`): `xcodebuild -workspace <ws> -scheme <scheme> -destination platform=iOS Simulator,id=<udid> build` — DerivedData defaults to xcodebuild's standard per-workspace location (override with the `derivedData` config field / `--derived-data`). That directory is where index-while-building writes the native index store and the `.xcactivitylog` build logs the built-in Build Server reads for navigation (see [`bsp-server.md`](bsp-server.md)), so it must not be relocated per-invocation. **Never** `CODE_SIGNING_ALLOWED=NO`. Stream stdout/stderr merged through the throttle (§5.2). Non-zero exit → extract `error:` lines + tail, fail pipeline.
 4. **App path**: `xcodebuild ... -showBuildSettings -json` → `TARGET_BUILD_DIR` + `WRAPPER_NAME` (cache per (workspace,scheme,udid) keyed on mtime to skip the ~2s call on rebuilds). **Bundle id**: `plutil -extract CFBundleIdentifier raw <app>/Info.plist` (shell-out; avoids a plist crate dep).
 4a. **Ingest build log** (`ingest_build_log`): fold the just-captured build log into the per-`(build_root, scheme)` compile store so the built-in `bsp` server can answer sourcekit-lsp's per-file compile-args queries. See [`bsp-server.md`](bsp-server.md).
 5. **Install**: `xcrun simctl install <udid> <app>`.
-6. **Launch**: `xcrun simctl launch --wait-for-debugger --terminate-running-process --stdout=$RUN/out.log --stderr=$RUN/err.log <udid> <bundle>` where `$RUN = ~/.zedxcode/run/<udid>/` (absolute paths; pre-truncate files). Never pass `--console-pty` (incompatible with --stdout/--stderr).
+6. **Launch**: `xcrun simctl launch --wait-for-debugger --terminate-running-process --stdout=$RUN/out.log --stderr=$RUN/err.log <udid> <bundle>` where `$RUN = ~/.zedxcode/run/<udid>/` (absolute paths; pre-truncate files). Never pass `--console-pty` (incompatible with --stdout/--stderr). The `simctl launch` process carries `SIMCTL_CHILD_NSUnbufferedIO=YES` (simctl hands each `SIMCTL_CHILD_<KEY>` to the app as `<KEY>`), so the app's stdout is unbuffered and each `print()` line reaches out.log, and the Debug Console, as it is written instead of in 4 KB blocks; a launch environment that sets `NSUnbufferedIO` itself keeps its own value. Only the variable names are logged, never their values.
 7. **PID**: parse `"<bundle>: <pid>"` from simctl stdout. Fallback: snapshot newest matching pid from `ps aux | grep CoreSimulator/Devices/<udid>/.../<App>.app/` **before** launch, poll 5×1 s for a changed pid after.
 8. Start **tailers** on out.log/err.log; optionally the oslog pump.
 
@@ -234,11 +239,11 @@ Verified: **no clear-console action exists** in Zed's debugger (console namespac
 | Command | Behavior |
 |---|---|
 | *(none)* | DAP proxy mode (with 2 s initialize guard) |
-| `build --workspace --scheme [--device] [--full-output]` | Pipeline phases 1–4 only; exit code = xcodebuild's. This is what `.zed/tasks.json` "Xcode: Build" (CMD+B) calls |
+| `build [--workspace] [--scheme] [--destination] [--os] [--configuration] [--full-output]` | Pipeline phases 1–4 only; exit code = xcodebuild's. This is what the "Xcode: Build" task (CMD+B) calls. Every flag is optional: the scheme, destination and configuration flags are layer 1 of `resolve()` for this invocation only and are never saved (`--device` is 0.1's spelling of `--destination`). A command line equal to one of the tasks 0.1's setup wrote into `<root>/.zed/tasks.json` (label, an xcode-dap command and the same args) keeps 0.1's order: its flags rank below both stores, and one line names the migration |
 | `run` | Phases 1–8 without debugger: launch *without* `--wait-for-debugger`, stream console to terminal |
 | `clean` | `xcodebuild -workspace … -scheme … clean` (CMD+Shift+K task) |
 | `console [-f/--follow]` | Print (or tail) the current run's app console logs from `~/.zedxcode/run/<udid>/{out,err}.log` |
-| `select-scheme` / `select-device` | Interactive pickers (or `--set`/`--list`) writing the `.zed/.zedx/selection.json` overlay used by the next run; `select-scheme` also regenerates `buildServer.json` for the new scheme |
+| `select-scheme` / `select-device` (alias `select-destination`) / `select-configuration` | Interactive pickers (or `--set`/`--list`/`--reset`) writing the selection store `.zed/.zedx/selection.json` (version 2) that the next run reads; `--reset` removes the project's choice so the next layer of `resolve()` answers; `select-scheme` also regenerates `buildServer.json` for the new scheme; `select-configuration` lists a workspace's configurations from one project it references: the one holding the chosen scheme's file, else the first that lists any |
 | `setup [--project <dir>] [--user] [--yes]` | §6.1 |
 | `refresh` | Re-run preflight (Tuist project regeneration) + touch buildServer.json + print "restart LSP" hint (`editor: restart language server`) |
 | `doctor` | Checks: Xcode + `xcrun -f lldb-dap`, simctl works, requested sim exists/booted, sourcekit-lsp, `buildServer.json` present + fresh + `argv` launching the built-in `bsp` server + recorded `build_root`/scheme still valid, compile-store health, rustup (dev), pidfile staleness, binary version vs extension expectation |
@@ -246,17 +251,24 @@ Verified: **no clear-console action exists** in Zed's debugger (console namespac
 
 ### 6.1 `setup` — port the verified JSONC marker-merge to Rust (decision: Rust, not Python)
 
-One binary, zero runtime deps (host python3 is 3.9 and another dep to doctor) — and the merge logic is mechanical text surgery, not parsing-heavy. Port the existing verified design 1:1:
+One binary, zero runtime deps (host python3 is 3.9 and another dep to doctor) — and the merge logic is mechanical text surgery, not parsing-heavy. Ported from the verified design, with blocks owned by hash since 0.2:
 
 ```rust
-// setup/jsonc.rs
-pub fn merge_marker_block(path: &Path, marker_id: &str, block: &str) -> Result<MergeOutcome>
-// 1. read file; timestamped backup "<file>.zedxcode-backup-<ts>"
-// 2. if "// >>> zedxcode:<id> >>>" .. "// <<< zedxcode:<id> <<<" exists → replace inner text
-// 3. else find insertion point: scan from EOF backwards for the final ']' / '}' of the
-//    top-level value using a tolerant scanner (tracks "strings", // and /* */ comments);
-//    insert ",\n" + block before it (handles JSONC trailing commas/comments without a parser)
-// 4. atomic write (tmp + rename)
+// setup/jsonc.rs — plan on text first (a dry run shows exactly what a real run writes)
+pub fn plan_merge(text: &str, spec: &BlockSpec, on_edited: OnEdited) -> Result<BlockChange>
+pub fn plan_remove(text: &str, spec: &BlockSpec, on_edited: OnEdited) -> Result<BlockChange>
+pub fn write_change(path: &Path, original: &str, change: &BlockChange) -> Result<Option<PathBuf>>
+// markers: "// >>> zedxcode:<id> v2 h=<fnv1a64 of the inner text, 16 hex> >>>" .. "// <<< zedxcode:<id> <<<"
+// 1. ours = the inner text still hashes to h, or (0.1's unversioned "// >>> zedxcode:<id> >>>")
+//    it equals 0.1's block byte for byte, or it holds exactly our entries (only formatting differs)
+// 2. ours → rewrite in place; absent → insert right after the opening '[' / '{' of the top-level
+//    value (Zed's own writers append at the end, which once put their entries inside our markers)
+// 3. edited by hand → left unchanged, foreign entries listed; --relocate moves them below the
+//    end marker verbatim (comments travel with their entry; in a keymap the later binding wins),
+//    then rewrites ours; --replace overwrites; --remove deletes only blocks that are ours
+// 4. a string- and comment-aware scanner finds the opener and splits elements / members;
+//    timestamped backup "<file>.zedxcode-backup-<ts>"; atomic write (tmp + rename);
+//    post-write validation, original restored on failure
 ```
 
 User-level (`--user`): keymap.json gets the marker block binding `cmd-r → debugger::Rerun`, `cmd-b`/`cmd-shift-k` → `task::Spawn {"task_name": "Xcode: Build"/"Xcode: Clean"}`, `cmd-shift-o → project_symbols::Toggle` — exactly the bindings already verified to coexist with `cmd-k` chords. Project-level: `.zed/debug.json` (adapter "Xcode" scenario with the project's workspace/scheme/device + the detected `"preflight"` command for generated projects), `.zed/tasks.json` (Build/Clean/Refresh/Console + Choose Scheme/Choose Destination pickers, all invoking `xcode-dap` by absolute binary path — Zed task shells don't have a dev install on PATH), `buildServer.json` written by the pure-Rust generator (`setup/build_server.rs`), whose `argv` points back at `xcode-dap bsp` — the toolkit's own built-in Build Server for sourcekit-lsp (see [`bsp-server.md`](bsp-server.md)) — append generated files to `.git/info/exclude`. Idempotent re-runs (marker replace), `--yes` for non-interactive. `--oslog` writes `"oslog": true` into the generated debug.json; without the flag a re-run preserves the value already in the existing file (enabled oslog is never silently reset).
@@ -281,6 +293,8 @@ configurationDone → expect process/stopped-or-running; expect app stdout/stder
 disconnect → expect response, process exit 0, app terminated on sim, no zombie children (ps check)
 ```
 
+`session --mock-pipeline --kill-after-response` ends the session the way Zed does: SIGKILL right after the disconnect response. By then `teardown: done` must be in the log (HOME is redirected, so the log is the run's own), the pidfile gone, and no lldb-dap, mock app or `log stream` left — the mock's OSLog pump runs against a stand-in `log stream` that ignores SIGTERM, so the bounded stop has to SIGKILL its group.
+
 Plus pure-Rust unit tests: framing codec (split headers, multi-message reads), peek classifier, seq rewrite, jsonc merge (fixtures with comments/trailing commas/existing markers), build-log filter. A `--mock-pipeline` hidden flag (skip xcodebuild, attach to a locally spawned dummy process via lldb-dap) makes the full DAP loop CI-testable without Xcode in <5 s.
 
 ## 9. Implementation order — verifiable gates
@@ -294,7 +308,7 @@ Plus pure-Rust unit tests: framing codec (split headers, multi-message reads), p
 | 4 | minimal dev extension (wasip2, registers "Xcode", schema) — coordinate with sibling agent | `zed: install dev extension` + `dap.Xcode.binary` override → New Session shows "Xcode"; first run via modal, then **CMD+R = debugger::Rerun** rebuilds+relaunches+reattaches with console in Debug Console (manual keybinding for now) |
 | 5 | `setup` (jsonc merge port, user + project), `doctor`, `refresh`; tasks for CMD+B / CMD+Shift+K | Fresh-machine dry run on a real iOS project: setup → CMD+R/CMD+B/CMD+Shift+K/CMD+Shift+O all work; cmd-k chords still work; backups created; re-run idempotent |
 | 6 | oslog flag, build-log filter polish | oslog stream interleaves in the Debug Console; filtered build output stays readable, full log on disk |
-| 7 | Release: GitHub Actions (macOS arm64+x86_64, `codesign -s -` ad-hoc, tar.gz + sha256), extension download path, README, publish PR to zed-industries/extensions | Clean machine: install from registry → setup → CMD+R works without local cargo |
+| 7 | Release: GitHub Actions (macOS arm64 only, `codesign -s -` ad-hoc, tar.gz + sha256), extension download path, README, publish PR to zed-industries/extensions | Clean machine: install from registry → setup → CMD+R works without local cargo |
 
 ## 10. Risks (proxy-specific)
 
@@ -308,7 +322,7 @@ Plus pure-Rust unit tests: framing codec (split headers, multi-message reads), p
 | Zombie lldb-dap / stale proxy on Rerun race | Med/Low | pidfile SIGTERM; `kill_on_drop`; doctor reports stale pidfiles |
 | Build log floods Debug Console | High/Med | Filter mode default + 50 ms/8 KB batching (§5.2); full log on disk |
 | PID parse fails (simctl output change / non-tty behavior under --console-pty) | Low/High | We use --stdout/--stderr mode (pid line verified); ps-poll fallback with pre-launch snapshot |
-| `--wait-for-debugger` hang if attach fails (app stuck stopped) | Med/Med | **Not implemented as a dedicated attach timeout** (known gap): the proxy waits for lldb-dap's attach response with no per-attach deadline (the only timeouts are `INIT_GUARD` 2 s, `TEARDOWN_GRACE` 2 s, `PIPELINE_DRAIN_GRACE` 10 s). An attach failure surfaces when lldb-dap answers; the suspended app is cleaned up at teardown via `terminateOnStop` |
+| `--wait-for-debugger` hang if attach fails (app stuck stopped) | Med/Med | `ATTACH_TIMEOUT` (30 s): an attach lldb-dap never answers fails the launch with an error, and teardown terminates the suspended app (a never-attached app is terminated regardless of `terminateOnStop`). An attach failure lldb-dap does answer surfaces at once; the app is cleaned up at teardown |
 | Gatekeeper/quarantine or missing signature on downloaded release binary | Med/Med | Zed's HTTP client doesn't set com.apple.quarantine; arm64 needs *some* signature → ad-hoc `codesign -s -` in CI; doctor checks `spctl`/runnability; fallback doc: `cargo install` from source |
 | oslog pump noise/duplication with stdout events | Med/Low | Off by default; documented; dedup deferred to v1.1 |
 | wasip2 assumption breaks on user's Zed version | Low/Low | Zed's builder picks the target itself and auto-installs it; we only require rustup-managed toolchain |

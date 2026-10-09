@@ -11,12 +11,13 @@ use crate::commands::build::{cancel_on_ctrl_c, exit_with_build_code, BuildArgs, 
 use crate::engine::{consoles, pipeline};
 
 pub async fn run(args: BuildArgs) -> anyhow::Result<()> {
-    let cfg = args.to_config();
+    let req = args.to_request()?;
+    let cfg = &req.options;
     let sink: Arc<CliSink> = Arc::new(CliSink);
     let cancel = CancellationToken::new();
     cancel_on_ctrl_c(cancel.clone());
 
-    let launched = match pipeline::run_pipeline(&cfg, false, sink.as_ref(), cancel.clone()).await {
+    let launched = match pipeline::run_pipeline(&req, false, sink.as_ref(), cancel.clone()).await {
         Ok(launched) => launched,
         Err(err) => return exit_with_build_code(err),
     };

@@ -1,7 +1,8 @@
 //! `xcode-dap doctor` — environment checks: Darwin, Xcode + `xcrun -f
 //! lldb-dap`, simctl, sourcekit-lsp, Zed, buildServer.json
-//! presence/freshness/contents + `argv` (when in a project), stale
-//! pidfiles. Exit code is non-zero when any ✗ check fails.
+//! presence/freshness/contents + `argv` and tasks that reuse the Xcode task
+//! labels (when in a project), stale pidfiles. Exit code is non-zero when
+//! any ✗ check fails.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,9 @@ use std::path::{Path, PathBuf};
 use anyhow::bail;
 
 use crate::engine::pipeline::zedxcode_home;
+use crate::engine::{destinations, project};
 use crate::setup::project::{build_server_opted_in, find_in_path};
+use crate::setup::task_collisions;
 use crate::util::paths::{mtime, workspace_mtime};
 
 #[derive(Default)]
@@ -130,30 +133,19 @@ async fn cmd_first_line(bin: &str, args: &[&str]) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
+/// The simulator inventory the pipeline uses: available iPhones and iPads on
+/// iOS runtimes, by device type (so renamed simulators count). A machine with
+/// only watchOS/tvOS/visionOS runtimes or devices must not read as a passing
+/// "simulators" check.
 async fn check_simctl(d: &mut Doctor) {
-    let out = tokio::process::Command::new("xcrun")
-        .args(["simctl", "list", "devices", "--json"])
-        .output()
-        .await;
-    let Ok(out) = out else {
-        d.fail("simctl", "xcrun not runnable");
-        return;
+    let inventory = match destinations::inventory().await {
+        Ok(inventory) => inventory,
+        Err(e) => {
+            d.fail("simctl", &format!("{e:#}"));
+            return;
+        }
     };
-    if !out.status.success() {
-        d.fail(
-            "simctl",
-            &format!(
-                "simctl list failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-        );
-        return;
-    }
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-        d.fail("simctl", "simctl list output is not JSON");
-        return;
-    };
-    let (available, booted) = count_ios_simulators(&v);
+    let (available, booted) = inventory.counts();
     if available == 0 {
         d.fail(
             "simulators",
@@ -166,50 +158,6 @@ async fn check_simctl(d: &mut Doctor) {
             &format!("{available} available, {booted} booted"),
         );
     }
-}
-
-/// `(available, booted)` iPhone/iPad simulators from `simctl list devices
-/// --json`. Only iOS runtimes and iPhone/iPad device names count — the
-/// pipeline's default resolution and `select-device` both require an
-/// iPhone/iPad on an iOS runtime (see [`crate::commands::select`]), so a
-/// machine with only watchOS/tvOS/visionOS runtimes (or only Apple
-/// Watch/TV-style devices) must not read as a passing "simulators" check.
-fn count_ios_simulators(v: &serde_json::Value) -> (usize, usize) {
-    let Some(devices) = v.get("devices").and_then(|x| x.as_object()) else {
-        return (0, 0);
-    };
-    let mut available = 0usize;
-    let mut booted = 0usize;
-    for (runtime, list) in devices {
-        // "...SimRuntime.iOS-26-3" -> iOS runtimes only.
-        if runtime
-            .rsplit('.')
-            .next()
-            .is_none_or(|r| !r.starts_with("iOS-"))
-        {
-            continue;
-        }
-        let Some(list) = list.as_array() else {
-            continue;
-        };
-        for dev in list {
-            let usable = dev
-                .get("isAvailable")
-                .and_then(|a| a.as_bool())
-                .unwrap_or(false)
-                && dev
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .is_some_and(|n| n.starts_with("iPhone") || n.starts_with("iPad"));
-            if usable {
-                available += 1;
-                if dev.get("state").and_then(|s| s.as_str()) == Some("Booted") {
-                    booted += 1;
-                }
-            }
-        }
-    }
-    (available, booted)
 }
 
 fn check_zed(d: &mut Doctor) {
@@ -366,15 +314,17 @@ fn zed_dap_binary_override(settings: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// In a project dir (has *.xcworkspace / *.xcodeproj / .zed): check
+/// In a project dir (an Xcode container per [`find_container`], or .zed): check
 /// buildServer.json presence, freshness relative to the workspace, its
 /// recorded build_root (DerivedData) and scheme.
 fn check_project(d: &mut Doctor) {
-    let Ok(cwd) = std::env::current_dir() else {
+    // The project root the other commands use, so `doctor` run from a
+    // subfolder (a terminal in `Sources/`) checks the project around it.
+    let Ok(root) = crate::commands::build::cli_root() else {
         return;
     };
-    let workspace = find_container(&cwd);
-    let in_project = workspace.is_some() || cwd.join(".zed").is_dir();
+    let workspace = find_container(&root);
+    let in_project = workspace.is_some() || root.join(".zed").is_dir();
     if !in_project {
         d.note(
             "project",
@@ -382,10 +332,11 @@ fn check_project(d: &mut Doctor) {
         );
         return;
     }
-    check_tasks_command(d, &cwd);
-    let build_server = cwd.join("buildServer.json");
+    check_tasks_command(d, &root);
+    check_task_labels(d, &root);
+    let build_server = root.join("buildServer.json");
     if !build_server.exists() {
-        if missing_build_server_is_failure(&cwd, workspace.is_some()) {
+        if missing_build_server_is_failure(&root, workspace.is_some()) {
             d.fail(
                 "buildServer.json",
                 "missing, and a root Package.swift exists — sourcekit-lsp will \
@@ -413,7 +364,7 @@ fn check_project(d: &mut Doctor) {
         ),
         _ => d.ok("buildServer.json", "present"),
     }
-    check_build_server_contents(d, &cwd, &build_server);
+    check_build_server_contents(d, &root, &build_server);
 }
 
 /// Missing buildServer.json escalates from warn to failure only when a
@@ -677,6 +628,43 @@ fn check_tasks_command(d: &mut Doctor, dir: &Path) {
     }
 }
 
+/// Tasks that reuse the `Xcode: …` labels without running xcode-dap, in the
+/// project's `.zed/tasks.json` and `.vscode/tasks.json` files (its own, the
+/// ones in folders below it and above it in the repository) and the user's
+/// Zed `tasks.json`: a label a key spawns by name (⌘B, ⇧⌘K) is a warning,
+/// any other `Xcode: …` label a note.
+fn check_task_labels(d: &mut Doctor, dir: &Path) {
+    let zed_config_dir = crate::setup::user::zed_config_dir().ok();
+    let findings = task_collisions::scan(Some(dir), zed_config_dir.as_deref());
+    if findings.is_empty() {
+        let checked = if zed_config_dir.is_some() {
+            "the project's .zed and .vscode tasks files and your Zed tasks.json"
+        } else {
+            "the project's .zed and .vscode tasks files"
+        };
+        d.ok(
+            "task labels",
+            &format!("no \"Xcode: …\" task that ZedXcode did not write in {checked}"),
+        );
+        return;
+    }
+    // scan reports project files under the canonical project path.
+    let base = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let own_tasks = base.join(".zed").join("tasks.json");
+    for finding in findings {
+        // check_tasks_command already warned that this file does not parse.
+        if finding.parse_error && finding.path == own_tasks {
+            continue;
+        }
+        let label = finding.path.strip_prefix(&base).unwrap_or(&finding.path);
+        let label = task_collisions::printable(&label.display().to_string());
+        match finding.level {
+            task_collisions::Level::Warn => d.warn(&label, &finding.text),
+            task_collisions::Level::Note => d.note(&label, &finding.text),
+        }
+    }
+}
+
 /// Reverse [`crate::setup::project::shell_quote`] for the executability
 /// check: an unquoted command is returned as-is; a single-quoted one has its
 /// outer quotes removed and the `'\''` escape (an embedded apostrophe)
@@ -697,28 +685,32 @@ fn is_executable(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
-/// The build container the freshness check compares against: the first
-/// `.xcworkspace` in sort order, else the first `.xcodeproj`. Workspaces
-/// win regardless of name order (matching `find_workspace` in
-/// `setup/project.rs` and `commands/select.rs`) — buildServer.json is
-/// generated from the workspace when one exists.
+/// The build container the freshness check compares against: what
+/// [`project::discover`] finds within two levels of `dir`.
+/// - A container below `dir` counts only when `dir` is a project root (it
+///   holds `.zed/` or buildServer.json, or is the git toplevel): a folder
+///   that holds several checkouts is not one project.
+/// - A tie in `dir` itself counts as it always did: the first of them in
+///   path order (in one directory, a workspace before a project, since
+///   buildServer.json is generated from the workspace when one exists). A
+///   deeper tie is no answer, and the freshness check is skipped.
 fn find_container(dir: &Path) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .map(|x| x == "xcworkspace" || x == "xcodeproj")
-                .unwrap_or(false)
-        })
-        .collect();
-    candidates.sort();
-    candidates
-        .iter()
-        .find(|p| p.extension().is_some_and(|x| x == "xcworkspace"))
-        .cloned()
-        .or_else(|| candidates.into_iter().next())
+    let in_dir = |c: &project::Container| c.relative.parent() == Some(Path::new(""));
+    let found = match project::discover(dir) {
+        Ok(found) => found,
+        Err(tie) => {
+            let first = tie.tied.into_iter().next()?;
+            return in_dir(&first).then_some(first.path);
+        }
+    };
+    let container = found.container?;
+    let project_root = dir.join(".zed").is_dir()
+        || dir.join("buildServer.json").is_file()
+        || found
+            .git
+            .toplevel
+            .is_some_and(|t| dir.canonicalize().is_ok_and(|d| d == t));
+    (in_dir(&container) || project_root).then_some(container.path)
 }
 
 /// Stale pidfiles under `~/.zedxcode/run` (owner process no longer alive).
@@ -875,6 +867,47 @@ mod tests {
     }
 
     #[test]
+    fn find_container_takes_a_nested_container_only_in_a_project_root() {
+        let dir = sandbox();
+        assert_eq!(find_container(&dir), None);
+        fs::create_dir_all(dir.join("ios/MyApp.xcworkspace")).unwrap();
+        fs::create_dir_all(dir.join("ios/MyApp.xcodeproj")).unwrap();
+        // An unmarked folder (no .zed/, buildServer.json or git) may just
+        // hold checkouts: not a project ...
+        assert_eq!(find_container(&dir), None);
+        // ... but the git toplevel is.
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success());
+        assert_eq!(
+            find_container(&dir),
+            Some(dir.join("ios/MyApp.xcworkspace"))
+        );
+        // So is a folder with .zed/ in it.
+        let zed = sandbox();
+        fs::create_dir_all(zed.join("ios/MyApp.xcodeproj")).unwrap();
+        fs::create_dir(zed.join(".zed")).unwrap();
+        assert_eq!(find_container(&zed), Some(zed.join("ios/MyApp.xcodeproj")));
+        // A deeper tie is no answer, even there: no silent pick.
+        fs::create_dir_all(zed.join("demo/Demo.xcodeproj")).unwrap();
+        assert_eq!(find_container(&zed), None);
+        // A container in the folder itself always counts, a tie there too
+        // (the first in path order), as before.
+        let root = sandbox();
+        fs::create_dir(root.join("MyApp.xcworkspace")).unwrap();
+        assert_eq!(find_container(&root), Some(root.join("MyApp.xcworkspace")));
+        fs::create_dir(root.join("Other.xcworkspace")).unwrap();
+        assert_eq!(find_container(&root), Some(root.join("MyApp.xcworkspace")));
+    }
+
+    #[test]
     fn scheme_mismatch_detection() {
         let bs = json!({ "scheme": "MyApp (staging)", "build_root": "/dd" });
         assert_eq!(
@@ -980,32 +1013,39 @@ mod tests {
 
     #[test]
     fn ios_simulator_count_ignores_non_ios_and_non_iphone_ipad() {
+        let count = |v: serde_json::Value| destinations::Inventory::parse(&v).unwrap().counts();
         let v = json!({
             "devices": {
                 "com.apple.CoreSimulator.SimRuntime.iOS-26-3": [
-                    { "name": "iPhone 16 Pro", "state": "Booted", "isAvailable": true },
-                    { "name": "iPad Pro 13-inch (M4)", "state": "Shutdown", "isAvailable": true },
-                    { "name": "iPhone 17", "state": "Shutdown", "isAvailable": false }
+                    { "udid": "44444444-AAAA-BBBB-CCCC-000000000001", "name": "iPhone 16 Pro",
+                      "state": "Booted", "isAvailable": true },
+                    { "udid": "44444444-AAAA-BBBB-CCCC-000000000002",
+                      "name": "iPad Pro 13-inch (M4)", "state": "Shutdown", "isAvailable": true },
+                    { "udid": "44444444-AAAA-BBBB-CCCC-000000000003", "name": "iPhone 17",
+                      "state": "Shutdown", "isAvailable": false }
                 ],
                 "com.apple.CoreSimulator.SimRuntime.watchOS-11-0": [
-                    { "name": "Apple Watch Ultra 2 (49mm)", "state": "Booted", "isAvailable": true }
+                    { "udid": "44444444-AAAA-BBBB-CCCC-000000000004",
+                      "name": "Apple Watch Ultra 2 (49mm)", "state": "Booted", "isAvailable": true }
                 ]
             }
         });
         // One iPhone + one iPad available, one booted; the unavailable iPhone
         // and the (booted) watchOS device are excluded.
-        assert_eq!(count_ios_simulators(&v), (2, 1));
+        assert_eq!(count(v), (2, 1));
 
         // A machine with only a watchOS runtime reads as zero usable
         // simulators (the case doctor previously false-PASSed).
         let watch_only = json!({
             "devices": {
                 "com.apple.CoreSimulator.SimRuntime.watchOS-11-0": [
-                    { "name": "Apple Watch Ultra 2 (49mm)", "state": "Shutdown", "isAvailable": true }
+                    { "udid": "44444444-AAAA-BBBB-CCCC-000000000005",
+                      "name": "Apple Watch Ultra 2 (49mm)", "state": "Shutdown",
+                      "isAvailable": true }
                 ]
             }
         });
-        assert_eq!(count_ios_simulators(&watch_only), (0, 0));
+        assert_eq!(count(watch_only), (0, 0));
     }
 
     #[test]

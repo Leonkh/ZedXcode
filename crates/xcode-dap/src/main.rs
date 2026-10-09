@@ -33,19 +33,22 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Build the scheme for the simulator (pipeline phases 1-4 only); exit code = xcodebuild's
+    /// Build the chosen scheme for the simulator (pipeline phases 1-4 only); flags override the choices for this build only; exit code = xcodebuild's
     Build(commands::build::BuildArgs),
-    /// Build, install and launch on the simulator without the debugger; console streams to the terminal
+    /// Build, install and launch on the simulator without the debugger; console streams to the terminal; flags as for build
     Run(commands::build::BuildArgs),
-    /// xcodebuild clean for the workspace/scheme
+    /// xcodebuild clean for the chosen scheme; flags override the choices for this clean only
     Clean(commands::clean::CleanArgs),
     /// Print/tail the current run's app console logs (~/.zedxcode/run/<udid>/{out,err}.log)
     Console(commands::console::ConsoleArgs),
-    /// Pick the scheme to build/run (interactive; writes .zed/.zedx/selection.json)
+    /// Choose the scheme to build/run (interactive, or --set/--list/--reset; saved in .zed/.zedx/selection.json)
     SelectScheme(commands::select::SelectSchemeArgs),
-    /// Pick the simulator destination (interactive; writes .zed/.zedx/selection.json)
+    /// Choose the simulator destination (interactive, or --set/--list/--reset; saved in .zed/.zedx/selection.json)
+    #[command(visible_alias = "select-destination")]
     SelectDevice(commands::select::SelectDeviceArgs),
-    /// Install Zed user keymap/settings blocks and per-project config
+    /// Choose the build configuration (interactive, or --set/--list/--reset; saved in .zed/.zedx/selection.json)
+    SelectConfiguration(commands::select::SelectConfigurationArgs),
+    /// Install the Zed user keymap block and per-project config
     Setup(commands::setup::SetupArgs),
     /// Re-run preflight (project regen) and refresh buildServer.json; prints LSP-restart hint
     Refresh,
@@ -66,6 +69,7 @@ async fn main() {
         Some(Command::Console(_)) => "console",
         Some(Command::SelectScheme(_)) => "select-scheme",
         Some(Command::SelectDevice(_)) => "select-device",
+        Some(Command::SelectConfiguration(_)) => "select-configuration",
         Some(Command::Setup(_)) => "setup",
         Some(Command::Refresh) => "refresh",
         Some(Command::Doctor) => "doctor",
@@ -80,6 +84,9 @@ async fn main() {
         Some(Command::Console(args)) => commands::console::run(args).await,
         Some(Command::SelectScheme(args)) => commands::select::run_select_scheme(args).await,
         Some(Command::SelectDevice(args)) => commands::select::run_select_device(args).await,
+        Some(Command::SelectConfiguration(args)) => {
+            commands::select::run_select_configuration(args).await
+        }
         Some(Command::Setup(args)) => commands::setup::run(args).await,
         Some(Command::Refresh) => commands::refresh::run().await,
         Some(Command::Doctor) => commands::doctor::run().await,

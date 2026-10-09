@@ -32,6 +32,25 @@ pub fn container_flag(path: &Path) -> &'static str {
     }
 }
 
+/// Expand a `$ZED_WORKTREE_ROOT`-templated path from `.zed/debug.json`
+/// against the project dir. Setup writes the value verbatim; a hand-editor
+/// may prefix it with `$ZED_WORKTREE_ROOT/` (or embed the token). Strips a
+/// leading `$ZED_WORKTREE_ROOT/` or substitutes the token, then anchors any
+/// still-relative result to `project` — never the cwd, which a command can
+/// be run from a subdirectory of.
+pub fn expand_worktree_root(value: &str, project: &Path) -> PathBuf {
+    let expanded = value
+        .strip_prefix("$ZED_WORKTREE_ROOT/")
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.replace("$ZED_WORKTREE_ROOT", &project.to_string_lossy()));
+    let p = Path::new(&expanded);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        project.join(p)
+    }
+}
+
 /// mtime of `path` (`None` when missing/unreadable).
 pub fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
@@ -64,6 +83,35 @@ pub fn buildserver_stale(build_server: Option<SystemTime>, workspace: Option<Sys
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn expand_worktree_root_anchors_to_project_not_cwd() {
+        let project = Path::new("/proj");
+        // Leading token is stripped and the remainder anchored to project.
+        assert_eq!(
+            expand_worktree_root("$ZED_WORKTREE_ROOT/dd", project),
+            PathBuf::from("/proj/dd")
+        );
+        // A token anywhere else is substituted.
+        assert_eq!(
+            expand_worktree_root("/cache$ZED_WORKTREE_ROOT/dd", project),
+            PathBuf::from("/cache/proj/dd")
+        );
+        assert_eq!(
+            expand_worktree_root("$ZED_WORKTREE_ROOT", project),
+            PathBuf::from("/proj")
+        );
+        // A plain relative value anchors to project (not the cwd).
+        assert_eq!(
+            expand_worktree_root("dd", project),
+            PathBuf::from("/proj/dd")
+        );
+        // An absolute value is used verbatim.
+        assert_eq!(
+            expand_worktree_root("/abs/dd", project),
+            PathBuf::from("/abs/dd")
+        );
+    }
 
     #[test]
     fn container_flag_dispatches_on_extension() {

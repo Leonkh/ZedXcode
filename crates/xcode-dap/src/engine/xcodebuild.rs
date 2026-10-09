@@ -18,8 +18,9 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::engine::config::{BuildOutput, LaunchConfig};
+use crate::engine::config::BuildOutput;
 use crate::engine::pipeline::OutputSink;
+use crate::setup::project::shell_quote;
 use crate::util::logging;
 use crate::util::paths::{container_flag, zedxcode_home};
 use crate::util::procgroup;
@@ -56,10 +57,23 @@ impl std::error::Error for BuildFailed {}
 /// How many trailing `error:` lines [`BuildFailed`] keeps.
 const MAX_ERROR_LINES: usize = 5;
 
+/// What xcodebuild builds, cleans or reads the settings of: the resolved
+/// container, scheme and configuration, and the build options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    /// The `.xcworkspace` or `.xcodeproj`, absolute.
+    pub workspace: PathBuf,
+    pub scheme: String,
+    /// `None` = the scheme's own configuration.
+    pub configuration: Option<String>,
+    pub derived_data: Option<PathBuf>,
+    pub build_output: BuildOutput,
+}
+
 /// `xcodebuild <container-flag> <workspace> -scheme <scheme> [-configuration
 /// <c>] [-derivedDataPath <dd>]` — the shared prefix for build / clean /
 /// showBuildSettings. Split out from [`base_cmd`] so [`resolve_build_root`]
-/// (which has no full [`LaunchConfig`]) reuses the exact same argument logic.
+/// (which has no full [`Target`]) reuses the exact same argument logic.
 fn settings_cmd(
     workspace: &Path,
     scheme: &str,
@@ -80,7 +94,7 @@ fn settings_cmd(
     cmd
 }
 
-fn base_cmd(cfg: &LaunchConfig) -> Command {
+fn base_cmd(cfg: &Target) -> Command {
     settings_cmd(
         &cfg.workspace,
         &cfg.scheme,
@@ -107,7 +121,7 @@ pub fn build_log_path() -> anyhow::Result<PathBuf> {
 /// the filter/throttle into `sink`. The full log always goes to
 /// `~/.zedxcode/logs/build-latest.log`.
 pub async fn build(
-    cfg: &LaunchConfig,
+    cfg: &Target,
     udid: &str,
     sink: &dyn OutputSink,
     cancel: CancellationToken,
@@ -252,7 +266,9 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
 }
 
 /// `xcodebuild ... clean` (= Xcode "Clean Build Folder"); stdio inherited.
-pub async fn clean(cfg: &LaunchConfig) -> anyhow::Result<()> {
+/// CLI only: DAP and BSP mode must never call it, because their stdout is
+/// the protocol stream.
+pub async fn clean(cfg: &Target) -> anyhow::Result<()> {
     let status = base_cmd(cfg)
         .arg("clean")
         .kill_on_drop(true)
@@ -272,6 +288,69 @@ pub async fn clean(cfg: &LaunchConfig) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 // App path via -showBuildSettings (mtime-keyed cache)
 // ---------------------------------------------------------------------------
+
+/// Deadline for one `xcodebuild -showBuildSettings`: it answers in seconds,
+/// unless Swift package resolution (which it runs first) is slow or stuck.
+const SETTINGS_DEADLINE: Duration = Duration::from_secs(120);
+
+/// When a `-showBuildSettings` call runs, which decides what its timeout
+/// message blames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsCall {
+    /// Before any build (the build root): package resolution may still be
+    /// fetching.
+    BeforeBuild,
+    /// After a successful build (the app path): the build already resolved
+    /// the packages.
+    AfterBuild,
+}
+
+/// Run a `-showBuildSettings` command under [`SETTINGS_DEADLINE`]; a missed
+/// deadline kills it (`kill_on_drop`) and fails with
+/// [`settings_timeout_message`].
+async fn show_build_settings(
+    cmd: &mut Command,
+    workspace: &Path,
+    scheme: &str,
+    call: SettingsCall,
+    what: &str,
+) -> anyhow::Result<std::process::Output> {
+    let output = cmd.stdin(Stdio::null()).kill_on_drop(true).output();
+    match tokio::time::timeout(SETTINGS_DEADLINE, output).await {
+        Ok(out) => out.with_context(|| format!("running {what}")),
+        Err(_) => {
+            let message = settings_timeout_message(workspace, scheme, call, SETTINGS_DEADLINE);
+            log::warn!(target: "xcodebuild", "{message}");
+            bail!(message)
+        }
+    }
+}
+
+/// What the user reads when `-showBuildSettings` misses its deadline: the
+/// step, then a command to run in a terminal to see where it stops.
+fn settings_timeout_message(
+    workspace: &Path,
+    scheme: &str,
+    call: SettingsCall,
+    deadline: Duration,
+) -> String {
+    let (cause, action) = match call {
+        SettingsCall::BeforeBuild => (
+            "Swift package resolution may be slow or stuck",
+            "-resolvePackageDependencies",
+        ),
+        SettingsCall::AfterBuild => ("xcodebuild may be stuck", "-showBuildSettings"),
+    };
+    format!(
+        "xcodebuild -showBuildSettings did not finish in {} s; {cause}: run \
+         \"xcodebuild {action} {} {} -scheme {}\" in a terminal to see where it stops, \
+         then retry.",
+        deadline.as_secs(),
+        container_flag(workspace),
+        shell_quote(&workspace.to_string_lossy()),
+        shell_quote(scheme)
+    )
+}
 
 #[derive(Serialize, Deserialize, Default)]
 struct SettingsCache {
@@ -294,7 +373,7 @@ fn cache_path() -> anyhow::Result<PathBuf> {
 /// configuration, derivedData)`. Two configs that would resolve different
 /// `.app` products (e.g. a different `-derivedDataPath`) must never share a
 /// cache entry.
-fn settings_cache_key(ws: &Path, cfg: &LaunchConfig, udid: &str) -> String {
+fn settings_cache_key(ws: &Path, cfg: &Target, udid: &str) -> String {
     format!(
         "{}|{}|{}|{}|{}",
         ws.display(),
@@ -330,7 +409,7 @@ fn workspace_mtime(workspace: &Path) -> anyhow::Result<u64> {
 /// not bump the workspace mtime, and the old cached `.app` path may still
 /// exist from a prior build — delete
 /// `~/.zedxcode/cache/build-settings.json` to force re-resolution.
-pub async fn app_path(cfg: &LaunchConfig, udid: &str) -> anyhow::Result<PathBuf> {
+pub async fn app_path(cfg: &Target, udid: &str) -> anyhow::Result<PathBuf> {
     let ws = std::path::absolute(&cfg.workspace).unwrap_or_else(|_| cfg.workspace.clone());
     let mtime = workspace_mtime(&ws)?;
     let key = settings_cache_key(&ws, cfg, udid);
@@ -353,15 +432,18 @@ pub async fn app_path(cfg: &LaunchConfig, udid: &str) -> anyhow::Result<PathBuf>
     log::info!(target: "xcodebuild", "app path cache miss — running -showBuildSettings");
 
     let started = std::time::Instant::now();
-    let out = base_cmd(cfg)
-        .arg("-destination")
+    let mut cmd = base_cmd(cfg);
+    cmd.arg("-destination")
         .arg(format!("platform=iOS Simulator,id={udid}"))
-        .args(["-showBuildSettings", "-json", "build"])
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .context("running xcodebuild -showBuildSettings")?;
+        .args(["-showBuildSettings", "-json", "build"]);
+    let out = show_build_settings(
+        &mut cmd,
+        &ws,
+        &cfg.scheme,
+        SettingsCall::AfterBuild,
+        "xcodebuild -showBuildSettings",
+    )
+    .await?;
     log::info!(
         target: "xcodebuild",
         "-showBuildSettings exited {} in {} ms",
@@ -491,18 +573,21 @@ pub async fn resolve_build_root(
     log::info!(target: "xcodebuild", "build_root cache miss — running -showBuildSettings");
 
     let started = std::time::Instant::now();
-    let out = settings_cmd(&ws, scheme, configuration, None)
-        // A generic simulator destination resolves settings without a booted
-        // device; BUILD_DIR (the per-workspace DerivedData root) is
-        // destination-independent anyway.
-        .arg("-destination")
+    let mut cmd = settings_cmd(&ws, scheme, configuration, None);
+    // A generic simulator destination resolves settings without a booted
+    // device; BUILD_DIR (the per-workspace DerivedData root) is
+    // destination-independent anyway.
+    cmd.arg("-destination")
         .arg("generic/platform=iOS Simulator")
-        .args(["-showBuildSettings", "-json", "build"])
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .context("running xcodebuild -showBuildSettings for build_root")?;
+        .args(["-showBuildSettings", "-json", "build"]);
+    let out = show_build_settings(
+        &mut cmd,
+        &ws,
+        scheme,
+        SettingsCall::BeforeBuild,
+        "xcodebuild -showBuildSettings for build_root",
+    )
+    .await?;
     log::info!(
         target: "xcodebuild",
         "-showBuildSettings (build_root) exited {} in {} ms",
@@ -783,19 +868,12 @@ mod tests {
 
     #[test]
     fn base_cmd_picks_container_flag_by_extension() {
-        let cfg = |workspace: &str| LaunchConfig {
+        let cfg = |workspace: &str| Target {
             workspace: PathBuf::from(workspace),
             scheme: "MyApp".into(),
-            device: None,
-            os: None,
             configuration: None,
-            preflight: None,
-            oslog: false,
-            oslog_predicate: None,
-            terminate_on_stop: true,
-            build_output: BuildOutput::Filtered,
-            verbose_logging: false,
             derived_data: None,
+            build_output: BuildOutput::Filtered,
         };
         let args = |workspace: &str| -> Vec<String> {
             base_cmd(&cfg(workspace))
@@ -818,6 +896,38 @@ mod tests {
         assert_eq!(
             args("MyApp.xcodeproj/project.xcworkspace")[..2],
             ["-workspace", "MyApp.xcodeproj/project.xcworkspace"]
+        );
+    }
+
+    #[test]
+    fn settings_timeout_message_names_the_step_and_the_fix() {
+        // Before a build, package resolution is the likely holdup.
+        assert_eq!(
+            settings_timeout_message(
+                Path::new("/Users/Jane/Projects/MyApp/MyApp.xcworkspace"),
+                "MyApp",
+                SettingsCall::BeforeBuild,
+                SETTINGS_DEADLINE
+            ),
+            "xcodebuild -showBuildSettings did not finish in 120 s; Swift package resolution \
+             may be slow or stuck: run \"xcodebuild -resolvePackageDependencies -workspace \
+             /Users/Jane/Projects/MyApp/MyApp.xcworkspace -scheme MyApp\" in a terminal to \
+             see where it stops, then retry."
+        );
+        // After a build the packages are resolved, so the message blames no
+        // cause it cannot know and repeats the call itself. A bare project
+        // goes through -project; paths and schemes with spaces stay one shell
+        // word each.
+        assert_eq!(
+            settings_timeout_message(
+                Path::new("/Users/x/My Apps/MyApp.xcodeproj"),
+                "MyApp Dev",
+                SettingsCall::AfterBuild,
+                SETTINGS_DEADLINE
+            ),
+            "xcodebuild -showBuildSettings did not finish in 120 s; xcodebuild may be stuck: \
+             run \"xcodebuild -showBuildSettings -project '/Users/x/My Apps/MyApp.xcodeproj' \
+             -scheme 'MyApp Dev'\" in a terminal to see where it stops, then retry."
         );
     }
 
@@ -864,26 +974,19 @@ mod tests {
         );
     }
 
-    fn cfg_with_derived_data(derived_data: Option<&str>) -> LaunchConfig {
-        LaunchConfig {
+    fn cfg_with_derived_data(derived_data: Option<&str>) -> Target {
+        Target {
             workspace: PathBuf::from("MyApp.xcworkspace"),
             scheme: "MyApp".into(),
-            device: None,
-            os: None,
             configuration: None,
-            preflight: None,
-            oslog: false,
-            oslog_predicate: None,
-            terminate_on_stop: true,
-            build_output: BuildOutput::Filtered,
-            verbose_logging: false,
             derived_data: derived_data.map(PathBuf::from),
+            build_output: BuildOutput::Filtered,
         }
     }
 
     #[test]
     fn base_cmd_appends_derived_data_path_when_set() {
-        let args = |cfg: &LaunchConfig| -> Vec<String> {
+        let args = |cfg: &Target| -> Vec<String> {
             base_cmd(cfg)
                 .as_std()
                 .get_args()

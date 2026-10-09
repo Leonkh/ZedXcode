@@ -6,6 +6,7 @@
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +17,12 @@ use crate::engine::pipeline::OutputSink;
 use crate::util::procgroup;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(75);
+
+/// How long [`OslogPump::stop_within`] waits for the pump task once it has
+/// SIGKILLed the `log stream` group (SIGKILL cannot be ignored, so the reap
+/// is immediate; the cap only guards against a task that never wakes). DAP
+/// teardown counts it into its time budget.
+pub const FORCED_STOP_REAP: Duration = Duration::from_millis(100);
 
 /// Handles to the running tailer tasks. Call [`stop`](Self::stop) on
 /// teardown — merely dropping detaches the tasks and leaves their poll
@@ -64,6 +71,10 @@ pub fn start_tailers(stdout_file: &Path, stderr_file: &Path, sink: Arc<dyn Outpu
 pub struct OslogPump {
     cancel: CancellationToken,
     handle: tokio::task::JoinHandle<()>,
+    /// Process group of the live `log stream` (0 before the spawn and once
+    /// the child is reaped), so a bounded stop can SIGKILL the group
+    /// without waiting for the pump task.
+    pgid: Arc<AtomicI32>,
 }
 
 impl OslogPump {
@@ -72,6 +83,27 @@ impl OslogPump {
     pub async fn stop(self) {
         self.cancel.cancel();
         let _ = self.handle.await;
+    }
+
+    /// [`stop`](Self::stop) with a deadline: when the group has not exited
+    /// within `grace` (a `log stream` that ignores SIGTERM, or a wedged
+    /// `simctl spawn`), SIGKILL it instead of waiting out the pump's own
+    /// escalation. For DAP teardown, which must answer Zed within a fixed
+    /// budget. Returns whether the SIGKILL was needed.
+    pub async fn stop_within(self, grace: Duration) -> bool {
+        self.cancel.cancel();
+        let mut handle = self.handle;
+        if tokio::time::timeout(grace, &mut handle).await.is_ok() {
+            return false;
+        }
+        procgroup::kill_group(self.pgid.load(Ordering::Acquire));
+        if tokio::time::timeout(FORCED_STOP_REAP, &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+        }
+        true
     }
 }
 
@@ -98,13 +130,19 @@ pub fn default_oslog_predicate(bundle_id: &str, app_name: &str) -> String {
 /// emitted instead of failing silently.
 pub fn start_oslog_pump(udid: &str, predicate: &str, sink: Arc<dyn OutputSink>) -> OslogPump {
     let cancel = CancellationToken::new();
+    let pgid = Arc::new(AtomicI32::new(0));
     let handle = tokio::spawn(pump_oslog(
         udid.to_string(),
         predicate.to_string(),
         sink,
         cancel.clone(),
+        pgid.clone(),
     ));
-    OslogPump { cancel, handle }
+    OslogPump {
+        cancel,
+        handle,
+        pgid,
+    }
 }
 
 async fn pump_oslog(
@@ -112,6 +150,7 @@ async fn pump_oslog(
     predicate: String,
     sink: Arc<dyn OutputSink>,
     cancel: CancellationToken,
+    pgid_slot: Arc<AtomicI32>,
 ) {
     let mut cmd = tokio::process::Command::new("xcrun");
     cmd.args(["simctl", "spawn", &udid, "log", "stream"])
@@ -138,6 +177,7 @@ async fn pump_oslog(
         }
     };
     let pgid = child.id().map(|p| p as i32).unwrap_or(0);
+    pgid_slot.store(pgid, Ordering::Release);
     // Collect stderr in the background so an early failure (e.g. an
     // NSPredicate parse error) can be reported after the stream ends.
     let stderr = child.stderr.take();
@@ -151,6 +191,7 @@ async fn pump_oslog(
     let Some(stdout) = child.stdout.take() else {
         procgroup::kill_group(pgid);
         let _ = child.wait().await;
+        pgid_slot.store(0, Ordering::Release);
         stderr_task.abort();
         return;
     };
@@ -178,6 +219,8 @@ async fn pump_oslog(
             child.wait().await.ok()
         }
     };
+    // Reaped: the pid (and so the group id) may be reused from here on.
+    pgid_slot.store(0, Ordering::Release);
     if exited_on_its_own {
         // The session is still running but oslog output stopped: say why,
         // otherwise e.g. a malformed `oslogPredicate` produces no output
