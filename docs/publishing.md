@@ -70,16 +70,21 @@ Versioning flow — the extension version and the proxy release tag move in
 lockstep: every extension version bump re-tags and re-releases the proxy at the
 same version, even when only the extension changed:
 
-1. Bump `version` in `extension/extension.toml` (e.g. `0.2.0`).
-2. Bump `PROXY_TAG` in `extension/src/lib.rs` to `xcode-dap-v0.2.0` and the
-   three crate versions (`crates/xcode-dap/Cargo.toml`,
-   `crates/xcode-dap-config/Cargo.toml`, `extension/Cargo.toml`) to match —
-   `scripts/check-versions.sh xcode-dap-v0.2.0` must pass, and release CI
-   hard-fails if any declaration and the tag disagree. Then refresh both
-   lockfiles: run `cargo update --workspace --offline` at the repository root
-   and again in `extension/`, and commit `Cargo.lock` and
-   `extension/Cargo.lock` with the bump. Every `--locked` build, the release
+1. Run `scripts/release.sh 0.2.0` (add `--dry-run` first to see every change
+   without writing anything). It sets the five version declarations —
+   `version` in `extension/extension.toml`, `PROXY_TAG` in
+   `extension/src/lib.rs` (`xcode-dap-v0.2.0`) and the three crate versions
+   in `crates/xcode-dap/Cargo.toml`, `crates/xcode-dap-config/Cargo.toml` and
+   `extension/Cargo.toml` — and refreshes `Cargo.lock` and
+   `extension/Cargo.lock` offline (`cargo update --workspace --offline` at the
+   repository root and in `extension/`): every `--locked` build, the release
    gate included, fails on a lockfile that still records the old versions.
+   Then it runs `scripts/gate.sh` and stages exactly those seven files. It
+   never commits or tags; release CI hard-fails if any declaration and the
+   tag disagree (`scripts/check-versions.sh xcode-dap-v0.2.0`).
+2. In `CHANGELOG.md`, move the Unreleased notes under `## [0.2.0]` with the
+   date and the Xcode and Zed versions the release was tested with, and stage
+   it. Commit with the title the script prints (`Release 0.2.0`).
 3. Tag and push `xcode-dap-v0.2.0` — the release workflow runs the gate,
    then builds, signs and uploads the Apple silicon asset and
    `SHA256SUMS.txt`. Verify the asset name against the contract in

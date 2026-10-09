@@ -4,7 +4,8 @@
 #
 #   fmt, clippy (-D warnings) and tests for the workspace; fmt, the wasm check
 #   and clippy for the extension; a debug build that the DAP and BSP smoke
-#   tests run; the version, dependency and fixture checks; a release build.
+#   tests run; the version check and the release script's test; the
+#   dependency and fixture checks; a release build.
 #
 # Hermetic: HOME and TMPDIR point into a temp dir for the whole run, so the
 # tests and smoke runs never read or write ~/.zedxcode or ~/.config/zed
@@ -73,6 +74,8 @@ python3 tests/bsp_smoke.py --binary "$bin"
 # stop the script.
 step "versions"
 scripts/check-versions.sh
+step "release script (in a throwaway copy)"
+python3 tests/release_smoke.py
 step "dependencies"
 scripts/check-deps.sh
 step "fixtures"
