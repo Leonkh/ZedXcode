@@ -2,35 +2,16 @@
 //! (project regen, e.g. Tuist), regenerate buildServer.json, print the
 //! "restart LSP" hint.
 
-use std::path::{Path, PathBuf};
-
 use anyhow::{bail, Context, Result};
 
-use crate::engine::selection;
+use crate::commands::build::{cli_root, CliSink};
+use crate::engine::{schemes, selection};
 use crate::setup::build_server::{regenerate, Regen};
 use crate::setup::jsonc;
-
-/// Expand a `$ZED_WORKTREE_ROOT`-templated path from `.zed/debug.json`
-/// against the project dir. Setup writes the value verbatim; a hand-editor
-/// may prefix it with `$ZED_WORKTREE_ROOT/` (or embed the token). Strips a
-/// leading `$ZED_WORKTREE_ROOT/` or substitutes the token, then anchors any
-/// still-relative result to `project` — never the cwd, which `select-scheme`
-/// can be run from a subdirectory of.
-pub(crate) fn expand_worktree_root(value: &str, project: &Path) -> PathBuf {
-    let expanded = value
-        .strip_prefix("$ZED_WORKTREE_ROOT/")
-        .map(str::to_owned)
-        .unwrap_or_else(|| value.replace("$ZED_WORKTREE_ROOT", &project.to_string_lossy()));
-    let p = Path::new(&expanded);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        project.join(p)
-    }
-}
+use crate::util::paths::expand_worktree_root;
 
 pub async fn run() -> Result<()> {
-    let dir = std::env::current_dir()?;
+    let dir = cli_root()?;
     let debug_json = dir.join(".zed").join("debug.json");
     if !debug_json.exists() {
         bail!(
@@ -49,20 +30,13 @@ pub async fn run() -> Result<()> {
         })
         .context("no \"Xcode\" scenario found in .zed/debug.json")?;
 
-    let dir_str = dir.to_string_lossy();
-    let workspace = scenario.get("workspace").and_then(|w| w.as_str()).map(|w| {
-        w.strip_prefix("$ZED_WORKTREE_ROOT/")
-            .map(str::to_owned)
-            .unwrap_or_else(|| w.replace("$ZED_WORKTREE_ROOT", &dir_str))
-    });
-    // The runtime selection overlay (select-scheme) wins over debug.json —
-    // regenerate buildServer.json for the scheme actually being run.
-    let scheme = selection::load(&dir).scheme.or_else(|| {
-        scenario
-            .get("scheme")
-            .and_then(|s| s.as_str())
-            .map(str::to_owned)
-    });
+    // The scheme a build would use: the selection store (or a linked
+    // worktree's main checkout store) over the scenario's key.
+    let picks = selection::current(&dir);
+    for warning in &picks.warnings {
+        println!("! {warning}");
+    }
+    let picked_scheme = picks.scheme.map(|s| s.value);
     // DerivedData from the scenario threads into the regenerated build_root
     // (setup writes it verbatim; a hand-editor may add $ZED_WORKTREE_ROOT).
     let derived_data = scenario
@@ -86,54 +60,54 @@ pub async fn run() -> Result<()> {
         println!("– no preflight configured; skipping project regeneration");
     }
 
-    // 2. regenerate buildServer.json
-    match (workspace.as_deref(), scheme.as_deref()) {
-        (Some(ws), Some(scheme)) => {
+    // 2. regenerate buildServer.json, for the container the build uses (the
+    // scenario's "workspace", else the one found in the project) and its
+    // scheme (the picked one, else the container's only scheme).
+    let workspace = match selection::cli_container(&dir, None) {
+        Ok(ws) => ws,
+        Err(e) => {
+            println!("! {e:#} — skipping buildServer.json refresh");
+            return finish();
+        }
+    };
+    let scheme = match picked_scheme {
+        Some(scheme) => Some(scheme),
+        None if workspace.exists() => match schemes::list(&workspace, &CliSink).await {
+            Ok(list) => match selection::settle_scheme(None, &list, &workspace) {
+                Ok(scheme) => Some(scheme.value),
+                Err(e) => {
+                    println!("! {e:#}");
+                    None
+                }
+            },
+            Err(e) => {
+                println!("! {e:#}");
+                None
+            }
+        },
+        None => None,
+    };
+    match scheme {
+        Some(scheme) => {
             let dd = derived_data.as_deref();
-            match regenerate(&dir, Path::new(ws), scheme, None, dd).await {
+            match regenerate(&dir, &workspace, &scheme, None, dd).await {
                 Regen::Written(_) => println!("✓ buildServer.json refreshed"),
                 Regen::MissingWorkspace => println!(
-                    "! workspace {ws} does not exist yet — run `xcode-dap refresh` \
-                     after the project is generated"
+                    "! workspace {} does not exist yet — run `xcode-dap refresh` \
+                     after the project is generated",
+                    workspace.display()
                 ),
                 Regen::Failed(e) => println!("✗ buildServer.json refresh failed: {e}"),
             }
         }
-        _ => println!("! scenario has no workspace/scheme — skipping buildServer.json refresh"),
+        None => println!("! no scheme to build — skipping buildServer.json refresh"),
     }
+    finish()
+}
 
-    // 3. LSP hint
+/// 3. The language-server hint.
+fn finish() -> Result<()> {
     println!("\nIn Zed: command palette → `editor: restart language server`");
     println!("(reloads go-to-definition after the project regeneration).");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn expand_worktree_root_anchors_to_project_not_cwd() {
-        let project = Path::new("/proj");
-        // Leading token is stripped and the remainder anchored to project.
-        assert_eq!(
-            expand_worktree_root("$ZED_WORKTREE_ROOT/dd", project),
-            PathBuf::from("/proj/dd")
-        );
-        // Embedded token is substituted.
-        assert_eq!(
-            expand_worktree_root("$ZED_WORKTREE_ROOT/build/dd", project),
-            PathBuf::from("/proj/build/dd")
-        );
-        // A plain relative value anchors to project (not the cwd).
-        assert_eq!(
-            expand_worktree_root("dd", project),
-            PathBuf::from("/proj/dd")
-        );
-        // An absolute value is used verbatim.
-        assert_eq!(
-            expand_worktree_root("/abs/dd", project),
-            PathBuf::from("/abs/dd")
-        );
-    }
 }

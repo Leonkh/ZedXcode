@@ -820,6 +820,7 @@ PURITY_SPAWNS = (
     ("xcode-select -p", r"xcode-select -p\b"),
     ("open <Simulator.app>", r"open /\S*/Simulator\.app$"),
     ("open -a Simulator", r"open -a Simulator\b"),
+    ("xcodebuild -list", r"xcodebuild -list\b"),
     ("xcodebuild -showBuildSettings", r"xcodebuild .*-showBuildSettings\b"),
     ("xcodebuild build", r"xcodebuild (?!.*-showBuildSettings).* build$"),
     ("git check-ignore", r"git check-ignore\b"),

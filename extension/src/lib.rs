@@ -200,13 +200,9 @@ impl zed::Extension for XcodeToolsExtension {
 
         // Sanity check only — full validation belongs to the proxy, which
         // parses the very same shared struct (crates/xcode-dap-config).
-        serde_json::from_str::<xcode_dap_config::LaunchConfig>(&config.config).map_err(|err| {
-            format!(
-                "Xcode Tools installed xcode-dap at {command}, but this scenario is incomplete: \
-                 {err}. Add \"workspace\" and \"scheme\" to it in .zed/debug.json, or run \
-                 \"{command}\" setup --project . in a terminal at the project root."
-            )
-        })?;
+        if let Err(err) = serde_json::from_str::<xcode_dap_config::LaunchConfig>(&config.config) {
+            return Err(invalid_scenario_message(&command, &config.config, &err));
+        }
 
         // User's shell env → DEVELOPER_DIR, PATH for xcrun/tuist/make.
         let mut envs = worktree.shell_env();
@@ -258,9 +254,8 @@ impl zed::Extension for XcodeToolsExtension {
     fn dap_config_to_scenario(&mut self, config: DebugConfig) -> Result<DebugScenario, String> {
         match config.request {
             // Generic New Session "Launch" tab (adapter-agnostic). Documented
-            // compromise: `program` maps to the Xcode scheme. The required
-            // `workspace` cannot be derived here — save the scenario to
-            // .zed/debug.json and fill it in (the schema flags the omission).
+            // compromise: `program` maps to the Xcode scheme. `workspace` is
+            // left out: the binary finds the project's container itself.
             DebugRequest::Launch(launch) => {
                 let mut scenario_config = serde_json::Map::new();
                 scenario_config.insert(
@@ -292,6 +287,23 @@ impl zed::Extension for XcodeToolsExtension {
             ),
         }
     }
+}
+
+/// The error for a scenario `config` that does not parse: it names the key
+/// at fault (each key is checked on its own once the whole object failed) and
+/// says where Scheme, Destination and Configuration are chosen instead. The
+/// text comes from the shared crate, where it is tested.
+fn invalid_scenario_message(command: &str, config: &str, err: &serde_json::Error) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(config).ok();
+    let invalid_key = parsed
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .and_then(|object| {
+            xcode_dap_config::invalid_key::<_, _, serde_json::Error>(
+                object.iter().map(|(key, value)| (key.as_str(), value)),
+            )
+        });
+    xcode_dap_config::invalid_scenario_message(command, invalid_key, err)
 }
 
 zed::register_extension!(XcodeToolsExtension);

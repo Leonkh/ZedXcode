@@ -32,12 +32,42 @@ Tested with: recorded when this becomes a release.
   result, without committing or tagging; `--dry-run` shows every change and
   writes nothing. This changelog records each release.
 - The unit tests build and run on Linux and other non-macOS hosts.
+- One selection store per project, `.zed/.zedx/selection.json` (version 2),
+  holds the chosen scheme, destination (UDID, name and iOS version) and
+  configuration, and the five most recent schemes and destinations. A 0.1
+  file still reads and is rewritten by the next pick. Writes lock the file,
+  re-read it and keep every key they do not know.
+- A git worktree without its own choice uses the main checkout's: it reads
+  the main checkout's store, and nothing is copied into the worktree.
 
 ### Changed
 
-- A scenario without `workspace` or `scheme` no longer fails before the binary
-  is downloaded: Xcode Tools downloads `xcode-dap` first, then names the
-  missing keys and the exact `setup --project` command that writes them.
+- `workspace` and `scheme` are optional in the Xcode scenario. Without
+  `workspace`, the workspace or project found in the project folder is built;
+  without a chosen scheme, the container's only scheme. Each of Scheme,
+  Destination and Configuration comes from the first place that sets it: the
+  selection store, the main checkout's store (in a worktree), the scenario's
+  `scheme` / `device` + `os` / `configuration` keys, then the automatic choice.
+  The flags of `xcode-dap build`, `run` and `clean` still rank below the store,
+  as in 0.1, and in a worktree also below the main checkout's store, so ⌘B
+  builds what ⌘R builds. Before anything boots, a scheme the container does
+  not have, a configuration an `.xcodeproj` does not list, several schemes
+  with none chosen, and a destination that is not available stop with a
+  message that names the picker; one console line shows each value and where
+  it came from.
+- A scenario that does not parse no longer fails before the binary is
+  downloaded: Xcode Tools downloads `xcode-dap` first, then names the key at
+  fault and says where Scheme, Destination and Configuration are chosen.
+- ⌘R, ⌘B, the destination picker, `doctor` and `setup` share one simulator
+  list. Renamed simulators are listed (by device type, not by name); the iOS
+  version matches loosely (`26`, `26.3` and `26.3.1` all find iOS 26.3, and a
+  version that matches several runtimes takes the newest with a warning); a
+  chosen destination is found by UDID first, then by name and iOS version.
+  The automatic destination is the booted iPhone, else the newest iPhone (by
+  model number) on the newest iOS runtime (`setup` no longer takes a booted
+  iPad).
+- The scheme list is cached until a scheme is added or removed in Xcode, not
+  only until the workspace file changes.
 - Releases are built on macOS 26 and published only after the gate passes; the
   release workflow can also run as a dry run that publishes nothing.
 - `setup --project` and `select-scheme` find the Xcode workspace or project

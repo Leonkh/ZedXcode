@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::engine::project;
+use crate::commands::build::CliSink;
+use crate::engine::{destinations, project, schemes};
 use crate::setup::jsonc;
-use crate::util::paths::container_flag;
 
 /// CLI overrides for [`setup_project`]; every `None` is auto-detected.
 #[derive(Debug, Clone, Default)]
@@ -151,106 +151,28 @@ fn find_workspace(dir: &Path) -> Result<String> {
     Ok(container.relative.to_string_lossy().into_owned())
 }
 
-/// `xcodebuild -list -json` -> the project's schemes; unambiguous or bail.
+/// The container's only scheme (`xcodebuild -list`, cached); several are an
+/// error that lists them.
 async fn detect_scheme(dir: &Path, workspace: &str) -> Result<String> {
-    let container_flag = container_flag(Path::new(workspace));
-    let out = tokio::process::Command::new("xcodebuild")
-        .args(["-list", "-json", container_flag, workspace])
-        .current_dir(dir)
-        .output()
-        .await
-        .context("failed to run `xcodebuild -list -json` — is Xcode installed?")?;
-    if !out.status.success() {
-        bail!(
-            "`xcodebuild -list -json {container_flag} {workspace}` failed:\n{}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).context("xcodebuild -list output is not JSON")?;
-    let schemes: Vec<String> = v
-        .get("workspace")
-        .or_else(|| v.get("project"))
-        .and_then(|c| c.get("schemes"))
-        .and_then(|s| s.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|s| s.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-    match schemes.len() {
-        0 => bail!("xcodebuild -list reported no schemes for {workspace}"),
-        1 => Ok(schemes.into_iter().next().unwrap()),
-        _ => bail!(
+    let container = dir.join(workspace);
+    let list = schemes::list(&container, &CliSink).await?;
+    match list.schemes.as_slice() {
+        [only] => Ok(only.clone()),
+        schemes => bail!(
             "multiple schemes — pass --scheme \"<name>\":\n  {}",
             schemes.join("\n  ")
         ),
     }
 }
 
-/// Pick a simulator: the booted iOS device if any, else the newest available
-/// iPhone (deterministic: highest OS version, then last name in sort order).
-/// Returns `(device_name, os_version)`.
+/// The simulator the automatic rule picks (the booted iPhone, else the
+/// newest iPhone on the newest iOS runtime), as `(name, os)`.
 async fn detect_device() -> Result<(String, Option<String>)> {
-    let out = tokio::process::Command::new("xcrun")
-        .args(["simctl", "list", "devices", "--json"])
-        .output()
-        .await
-        .context("failed to run `xcrun simctl list devices --json`")?;
-    if !out.status.success() {
-        bail!(
-            "simctl list failed:\n{}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).context("simctl list output is not JSON")?;
-    let devices = v
-        .get("devices")
-        .and_then(|d| d.as_object())
-        .context("simctl list output has no devices")?;
-    let mut candidates: Vec<(Vec<u32>, String, String)> = vec![]; // (version, name, os)
-    for (runtime, list) in devices {
-        // "com.apple.CoreSimulator.SimRuntime.iOS-26-3" -> "26.3"
-        let Some(os) = runtime
-            .rsplit('.')
-            .next()
-            .and_then(|r| r.strip_prefix("iOS-"))
-            .map(|r| r.replace('-', "."))
-        else {
-            continue; // non-iOS runtime
-        };
-        let Some(list) = list.as_array() else {
-            continue;
-        };
-        for dev in list {
-            let available = dev
-                .get("isAvailable")
-                .and_then(|a| a.as_bool())
-                .unwrap_or(false);
-            let name = dev.get("name").and_then(|n| n.as_str()).unwrap_or_default();
-            let state = dev
-                .get("state")
-                .and_then(|s| s.as_str())
-                .unwrap_or_default();
-            if !available || name.is_empty() {
-                continue;
-            }
-            if state == "Booted" {
-                return Ok((name.to_owned(), Some(os.clone())));
-            }
-            if name.starts_with("iPhone") {
-                let version: Vec<u32> = os.split('.').map(|p| p.parse().unwrap_or(0)).collect();
-                candidates.push((version, name.to_owned(), os.clone()));
-            }
-        }
-    }
-    candidates.sort();
-    match candidates.pop() {
-        Some((_, name, os)) => Ok((name, Some(os))),
-        None => bail!("no available iPhone simulator found — pass --device \"<name or udid>\""),
-    }
+    let inventory = destinations::inventory().await?;
+    let device = destinations::resolve(None, &inventory, "automatic")
+        .map_err(|e| anyhow::anyhow!("{e} Or pass --device \"<name or udid>\"."))?
+        .device;
+    Ok((device.name.clone(), Some(device.os_version())))
 }
 
 /// `"oslog"` of the first scenario in an existing `.zed/debug.json`

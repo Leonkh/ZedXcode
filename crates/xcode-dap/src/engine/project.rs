@@ -231,9 +231,6 @@ impl Project {
     /// taken in the main checkout); `None` for any other checkout. The root
     /// is canonicalized first, so a root given through a symlink (or as
     /// `/var/...` for `/private/var/...`) still maps.
-    // The read-through to the main checkout's selection; it has no caller
-    // until the selection resolver lands.
-    #[allow(dead_code)]
     pub fn main_checkout_root(&self) -> Option<PathBuf> {
         if !self.git.linked_worktree {
             return None;
@@ -251,17 +248,41 @@ impl Project {
             main.join(below)
         })
     }
+
+    /// The project at `root` without the container search: only the git
+    /// checkout around it, for callers that need no container (where the
+    /// main checkout's selection store is).
+    pub fn without_search(root: &Path) -> Project {
+        let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+        let git = git_info(&root);
+        Project {
+            root,
+            container: None,
+            generator: None,
+            git,
+        }
+    }
 }
 
 /// The project root for a process Zed starts: the debug adapter runs with
 /// the worktree root as its cwd, and so does every task (`cwd` is
 /// `$ZED_WORKTREE_ROOT`), so the root is that cwd (canonical, like the
 /// [`GitInfo`] paths).
-// The debug adapter's entry point; it has no caller until the selection
-// resolver moves the adapter onto it.
-#[allow(dead_code)]
 pub fn root_from_zed(cwd: &Path) -> PathBuf {
     canonical(cwd)
+}
+
+/// The project root for an `xcode-dap` command: in a task Zed runs, whose
+/// cwd is the worktree root that Zed also exports as `ZED_WORKTREE_ROOT`,
+/// the worktree root, as ⌘R takes it ([`root_from_zed`]); anywhere else the
+/// root found from the cwd ([`root_from_terminal`]). The variable counts
+/// only while the cwd is that folder: a script the task starts elsewhere
+/// inherits it.
+pub fn root_for_cli(cwd: &Path, zed_worktree_root: Option<&Path>) -> PathBuf {
+    match zed_worktree_root.filter(|w| !w.as_os_str().is_empty()) {
+        Some(worktree) if canonical(worktree) == canonical(cwd) => root_from_zed(cwd),
+        _ => root_from_terminal(cwd),
+    }
 }
 
 /// The project root for a command typed in a terminal, which may run in any
@@ -272,9 +293,6 @@ pub fn root_from_zed(cwd: &Path) -> PathBuf {
 /// checkout's. The home directory is never the answer unless it is `cwd`
 /// (a stray `~/.zed` or a home-directory repository is not a project).
 /// The result is canonical, like the [`GitInfo`] paths.
-// The CLI's entry point; it has no caller until the selection resolver moves
-// the commands onto it.
-#[allow(dead_code)]
 pub fn root_from_terminal(cwd: &Path) -> PathBuf {
     terminal_root(cwd, home_dir().as_deref())
 }
@@ -340,9 +358,6 @@ pub fn discover(root: &Path) -> std::result::Result<Project, Ambiguous> {
 /// `"workspace"` set in the scenario, `--workspace`; absolute or relative to
 /// `root`): no container search, so no tie. The generator is the one on the
 /// way to that container, as [`discover`] picks it.
-// The resolver's path for an explicit workspace; it has no caller until the
-// selection resolver lands.
-#[allow(dead_code)]
 pub fn with_container(root: &Path, container: &Path) -> Project {
     let (root, found) = search(root);
     let path = root.join(container); // an absolute `container` replaces `root`
@@ -1184,6 +1199,22 @@ mod tests {
         let link = sandbox().join("link");
         std::os::unix::fs::symlink(repo.join("MyApp"), &link).unwrap();
         assert_eq!(root_from_zed(&link), repo.join("MyApp"));
+    }
+
+    #[test]
+    fn a_zed_task_takes_the_worktree_root_as_cmd_r_does() {
+        // A Zed worktree below the folder that holds `.zed/`.
+        let outer = sandbox();
+        mkdirs(&outer, &[".zed", "MyApp/Sources"]);
+        let worktree = outer.join("MyApp");
+        assert_eq!(root_for_cli(&worktree, None), outer);
+        assert_eq!(root_for_cli(&worktree, Some(&worktree)), worktree);
+        // Elsewhere the variable is only inherited: the cwd decides.
+        assert_eq!(
+            root_for_cli(&worktree.join("Sources"), Some(&worktree)),
+            outer
+        );
+        assert_eq!(root_for_cli(&worktree, Some(Path::new(""))), outer);
     }
 
     #[test]

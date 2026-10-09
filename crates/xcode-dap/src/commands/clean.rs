@@ -4,10 +4,11 @@
 use std::path::PathBuf;
 
 use anyhow::bail;
+use tokio_util::sync::CancellationToken;
 
-use crate::commands::build::{exit_with_build_code, CliSink};
-use crate::engine::config::{BuildOutput, LaunchConfig};
-use crate::engine::{selection, xcodebuild};
+use crate::commands::build::{absolute, cancel_on_ctrl_c, cli_root, exit_with_build_code, CliSink};
+use crate::engine::selection::{CliFlags, Request};
+use crate::engine::{pipeline, xcodebuild};
 
 #[derive(clap::Args, Debug)]
 pub struct CleanArgs {
@@ -33,23 +34,22 @@ pub async fn run(args: CleanArgs) -> anyhow::Result<()> {
             args.workspace.display()
         );
     }
-    let cfg = LaunchConfig {
-        workspace: args.workspace,
-        scheme: args.scheme,
-        device: None, // unused by clean
-        os: None,
-        configuration: args.configuration,
-        preflight: None,
-        oslog: false,
-        oslog_predicate: None,
-        terminate_on_stop: true,
-        build_output: BuildOutput::Filtered,
-        verbose_logging: false,
-        derived_data: args.derived_data,
-    };
-    // select-scheme overlay applies to clean too (cleaning the scheme the
-    // user actually runs); device/os in the overlay are unused by clean.
-    let cfg = selection::overlaid(&cfg, &CliSink);
+    let req = Request::for_cli(
+        cli_root()?,
+        CliFlags {
+            workspace: Some(absolute(&args.workspace)),
+            scheme: Some(args.scheme),
+            configuration: args.configuration,
+            derived_data: args.derived_data,
+            ..Default::default()
+        },
+    );
+    // The selection store applies to clean too (cleaning the scheme the user
+    // actually runs); no simulator is needed.
+    let cancel = CancellationToken::new();
+    cancel_on_ctrl_c(cancel.clone());
+    let prepared = pipeline::prepare(&req, &CliSink, &cancel, false).await?;
+    let cfg = prepared.target;
     match xcodebuild::clean(&cfg).await {
         Ok(()) => {
             eprintln!("Clean succeeded");

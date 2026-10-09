@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::bail;
 
 use crate::engine::pipeline::zedxcode_home;
-use crate::engine::project;
+use crate::engine::{destinations, project};
 use crate::setup::project::{build_server_opted_in, find_in_path};
 use crate::setup::task_collisions;
 use crate::util::paths::{mtime, workspace_mtime};
@@ -133,30 +133,19 @@ async fn cmd_first_line(bin: &str, args: &[&str]) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
+/// The simulator inventory the pipeline uses: available iPhones and iPads on
+/// iOS runtimes, by device type (so renamed simulators count). A machine with
+/// only watchOS/tvOS/visionOS runtimes or devices must not read as a passing
+/// "simulators" check.
 async fn check_simctl(d: &mut Doctor) {
-    let out = tokio::process::Command::new("xcrun")
-        .args(["simctl", "list", "devices", "--json"])
-        .output()
-        .await;
-    let Ok(out) = out else {
-        d.fail("simctl", "xcrun not runnable");
-        return;
+    let inventory = match destinations::inventory().await {
+        Ok(inventory) => inventory,
+        Err(e) => {
+            d.fail("simctl", &format!("{e:#}"));
+            return;
+        }
     };
-    if !out.status.success() {
-        d.fail(
-            "simctl",
-            &format!(
-                "simctl list failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-        );
-        return;
-    }
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-        d.fail("simctl", "simctl list output is not JSON");
-        return;
-    };
-    let (available, booted) = count_ios_simulators(&v);
+    let (available, booted) = inventory.counts();
     if available == 0 {
         d.fail(
             "simulators",
@@ -169,50 +158,6 @@ async fn check_simctl(d: &mut Doctor) {
             &format!("{available} available, {booted} booted"),
         );
     }
-}
-
-/// `(available, booted)` iPhone/iPad simulators from `simctl list devices
-/// --json`. Only iOS runtimes and iPhone/iPad device names count — the
-/// pipeline's default resolution and `select-device` both require an
-/// iPhone/iPad on an iOS runtime (see [`crate::commands::select`]), so a
-/// machine with only watchOS/tvOS/visionOS runtimes (or only Apple
-/// Watch/TV-style devices) must not read as a passing "simulators" check.
-fn count_ios_simulators(v: &serde_json::Value) -> (usize, usize) {
-    let Some(devices) = v.get("devices").and_then(|x| x.as_object()) else {
-        return (0, 0);
-    };
-    let mut available = 0usize;
-    let mut booted = 0usize;
-    for (runtime, list) in devices {
-        // "...SimRuntime.iOS-26-3" -> iOS runtimes only.
-        if runtime
-            .rsplit('.')
-            .next()
-            .is_none_or(|r| !r.starts_with("iOS-"))
-        {
-            continue;
-        }
-        let Some(list) = list.as_array() else {
-            continue;
-        };
-        for dev in list {
-            let usable = dev
-                .get("isAvailable")
-                .and_then(|a| a.as_bool())
-                .unwrap_or(false)
-                && dev
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .is_some_and(|n| n.starts_with("iPhone") || n.starts_with("iPad"));
-            if usable {
-                available += 1;
-                if dev.get("state").and_then(|s| s.as_str()) == Some("Booted") {
-                    booted += 1;
-                }
-            }
-        }
-    }
-    (available, booted)
 }
 
 fn check_zed(d: &mut Doctor) {
@@ -373,11 +318,13 @@ fn zed_dap_binary_override(settings: &serde_json::Value) -> Option<String> {
 /// buildServer.json presence, freshness relative to the workspace, its
 /// recorded build_root (DerivedData) and scheme.
 fn check_project(d: &mut Doctor) {
-    let Ok(cwd) = std::env::current_dir() else {
+    // The project root the other commands use, so `doctor` run from a
+    // subfolder (a terminal in `Sources/`) checks the project around it.
+    let Ok(root) = crate::commands::build::cli_root() else {
         return;
     };
-    let workspace = find_container(&cwd);
-    let in_project = workspace.is_some() || cwd.join(".zed").is_dir();
+    let workspace = find_container(&root);
+    let in_project = workspace.is_some() || root.join(".zed").is_dir();
     if !in_project {
         d.note(
             "project",
@@ -385,11 +332,11 @@ fn check_project(d: &mut Doctor) {
         );
         return;
     }
-    check_tasks_command(d, &cwd);
-    check_task_labels(d, &cwd);
-    let build_server = cwd.join("buildServer.json");
+    check_tasks_command(d, &root);
+    check_task_labels(d, &root);
+    let build_server = root.join("buildServer.json");
     if !build_server.exists() {
-        if missing_build_server_is_failure(&cwd, workspace.is_some()) {
+        if missing_build_server_is_failure(&root, workspace.is_some()) {
             d.fail(
                 "buildServer.json",
                 "missing, and a root Package.swift exists — sourcekit-lsp will \
@@ -417,7 +364,7 @@ fn check_project(d: &mut Doctor) {
         ),
         _ => d.ok("buildServer.json", "present"),
     }
-    check_build_server_contents(d, &cwd, &build_server);
+    check_build_server_contents(d, &root, &build_server);
 }
 
 /// Missing buildServer.json escalates from warn to failure only when a
@@ -1066,32 +1013,39 @@ mod tests {
 
     #[test]
     fn ios_simulator_count_ignores_non_ios_and_non_iphone_ipad() {
+        let count = |v: serde_json::Value| destinations::Inventory::parse(&v).unwrap().counts();
         let v = json!({
             "devices": {
                 "com.apple.CoreSimulator.SimRuntime.iOS-26-3": [
-                    { "name": "iPhone 16 Pro", "state": "Booted", "isAvailable": true },
-                    { "name": "iPad Pro 13-inch (M4)", "state": "Shutdown", "isAvailable": true },
-                    { "name": "iPhone 17", "state": "Shutdown", "isAvailable": false }
+                    { "udid": "44444444-AAAA-BBBB-CCCC-000000000001", "name": "iPhone 16 Pro",
+                      "state": "Booted", "isAvailable": true },
+                    { "udid": "44444444-AAAA-BBBB-CCCC-000000000002",
+                      "name": "iPad Pro 13-inch (M4)", "state": "Shutdown", "isAvailable": true },
+                    { "udid": "44444444-AAAA-BBBB-CCCC-000000000003", "name": "iPhone 17",
+                      "state": "Shutdown", "isAvailable": false }
                 ],
                 "com.apple.CoreSimulator.SimRuntime.watchOS-11-0": [
-                    { "name": "Apple Watch Ultra 2 (49mm)", "state": "Booted", "isAvailable": true }
+                    { "udid": "44444444-AAAA-BBBB-CCCC-000000000004",
+                      "name": "Apple Watch Ultra 2 (49mm)", "state": "Booted", "isAvailable": true }
                 ]
             }
         });
         // One iPhone + one iPad available, one booted; the unavailable iPhone
         // and the (booted) watchOS device are excluded.
-        assert_eq!(count_ios_simulators(&v), (2, 1));
+        assert_eq!(count(v), (2, 1));
 
         // A machine with only a watchOS runtime reads as zero usable
         // simulators (the case doctor previously false-PASSed).
         let watch_only = json!({
             "devices": {
                 "com.apple.CoreSimulator.SimRuntime.watchOS-11-0": [
-                    { "name": "Apple Watch Ultra 2 (49mm)", "state": "Shutdown", "isAvailable": true }
+                    { "udid": "44444444-AAAA-BBBB-CCCC-000000000005",
+                      "name": "Apple Watch Ultra 2 (49mm)", "state": "Shutdown",
+                      "isAvailable": true }
                 ]
             }
         });
-        assert_eq!(count_ios_simulators(&watch_only), (0, 0));
+        assert_eq!(count(watch_only), (0, 0));
     }
 
     #[test]

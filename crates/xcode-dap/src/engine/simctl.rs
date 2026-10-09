@@ -1,4 +1,4 @@
-//! simctl: device resolution, boot, the simulator window, install, launch,
+//! simctl: the device list, boot, the simulator window, install, launch,
 //! terminate, pid fallback, and the deadlines on those calls.
 //! See `docs/design/dap-proxy.md` §4 (phases 2, 5-7).
 
@@ -78,13 +78,9 @@ const HELPER_DEADLINE: Duration = Duration::from_secs(15);
 /// wait, so this patience costs a run nothing in the common case.
 const WINDOW_OPEN_DEADLINE: Duration = Duration::from_secs(60);
 
-/// `xcrun simctl list devices --json` -> match by udid-or-name (+ optional
-/// OS runtime), prefer Booted, deterministic sort. Returns the UDID.
-///
-/// The special query `"booted"` matches any currently booted device.
-/// `device: None` = default resolution: prefer the booted iPhone, else the
-/// newest available iPhone (highest OS, then last name in sort order).
-pub async fn resolve_device(device: Option<&str>, os: Option<&str>) -> anyhow::Result<String> {
+/// `xcrun simctl list devices --json`, parsed, under the list deadline.
+/// [`crate::engine::destinations`] turns it into the simulator inventory.
+pub async fn list_devices_json() -> anyhow::Result<Value> {
     let mut cmd = Command::new("xcrun");
     cmd.args(["simctl", "list", "devices", "--json"]);
     let out = output_step(&mut cmd, "xcrun simctl list devices --json", Step::List, "").await?;
@@ -94,130 +90,7 @@ pub async fn resolve_device(device: Option<&str>, os: Option<&str>) -> anyhow::R
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let json: Value =
-        serde_json::from_slice(&out.stdout).context("parsing simctl device list JSON")?;
-    pick_device(&json, device, os)
-}
-
-#[derive(Debug)]
-struct Candidate {
-    udid: String,
-    name: String,
-    booted: bool,
-    os: (u32, u32),
-}
-
-/// Pure device selection over the parsed `simctl list devices --json`
-/// output (separated from the shell-out for unit testing).
-///
-/// `query: None` candidates are all iPhones; the sort below then yields
-/// "booted iPhone first, else newest available iPhone".
-fn pick_device(json: &Value, query: Option<&str>, os: Option<&str>) -> anyhow::Result<String> {
-    let devices = json
-        .get("devices")
-        .and_then(Value::as_object)
-        .context("malformed simctl JSON: missing `devices` object")?;
-    // "26.3" -> runtime key suffix "iOS-26-3"
-    let os_suffix = os.map(|v| format!("iOS-{}", v.replace('.', "-")));
-
-    let mut candidates: Vec<Candidate> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
-    for (runtime, devs) in devices {
-        // iOS simulators only (skips watchOS/tvOS runtimes).
-        if !runtime.contains("SimRuntime.iOS") {
-            continue;
-        }
-        if let Some(sfx) = &os_suffix {
-            if !runtime.ends_with(sfx.as_str()) {
-                continue;
-            }
-        }
-        let Some(arr) = devs.as_array() else { continue };
-        for d in arr {
-            if !d
-                .get("isAvailable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let (Some(udid), Some(name), Some(state)) = (
-                d.get("udid").and_then(Value::as_str),
-                d.get("name").and_then(Value::as_str),
-                d.get("state").and_then(Value::as_str),
-            ) else {
-                continue;
-            };
-            let version = runtime_version(runtime);
-            seen.push(format!("{name} (iOS {}.{}, {state})", version.0, version.1));
-            let booted = state == "Booted";
-            let matches = match query {
-                Some(q) => {
-                    q.eq_ignore_ascii_case(udid)
-                        || q.eq_ignore_ascii_case(name)
-                        || (q.eq_ignore_ascii_case("booted") && booted)
-                }
-                None => name.starts_with("iPhone"),
-            };
-            if matches {
-                candidates.push(Candidate {
-                    udid: udid.to_string(),
-                    name: name.to_string(),
-                    booted,
-                    os: version,
-                });
-            }
-        }
-    }
-    if candidates.is_empty() {
-        let os_note = os.map(|o| format!(" (iOS {o})")).unwrap_or_default();
-        let what = match query {
-            Some(q) => format!("matching \"{q}\""),
-            None => "(no \"device\" configured: looked for an iPhone)".to_string(),
-        };
-        // `seen` is empty when the runtime filter excluded every device —
-        // an empty "available devices" list would be useless guidance.
-        if seen.is_empty() {
-            let why = match os {
-                Some(o) => format!("no iOS {o} simulator runtime is installed"),
-                None => "no iOS simulator devices are available".to_string(),
-            };
-            bail!(
-                "no available simulator {what}{os_note}: {why}\n\
-                 hint: install the runtime and create a device in Xcode \
-                 (Settings → Components, Window → Devices and Simulators)"
-            );
-        }
-        seen.sort();
-        bail!(
-            "no available simulator {what}{os_note}; available devices:\n  {}\n\
-             hint: pass --device \"<name or udid>\" (or set \"device\" in .zed/debug.json)",
-            seen.join("\n  ")
-        );
-    }
-    // Deterministic: Booted first, then newest OS, then name, then udid.
-    // With an explicit query the name tie-break is ascending (candidates
-    // usually share one name anyway); with `query: None` it is descending,
-    // so the newest iPhone model wins within the same OS.
-    candidates.sort_by(|a, b| {
-        let name_order = match query {
-            Some(_) => a.name.cmp(&b.name),
-            None => b.name.cmp(&a.name),
-        };
-        b.booted
-            .cmp(&a.booted)
-            .then(b.os.cmp(&a.os))
-            .then(name_order)
-            .then(a.udid.cmp(&b.udid))
-    });
-    Ok(candidates.remove(0).udid)
-}
-
-/// "com.apple.CoreSimulator.SimRuntime.iOS-26-3" -> (26, 3)
-fn runtime_version(runtime: &str) -> (u32, u32) {
-    let tail = runtime.rsplit("iOS-").next().unwrap_or("");
-    let mut parts = tail.split('-').filter_map(|p| p.parse::<u32>().ok());
-    (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
+    serde_json::from_slice(&out.stdout).context("parsing simctl device list JSON")
 }
 
 /// Time budget for retrying a `simctl boot` racing a shutdown in flight
@@ -793,7 +666,6 @@ async fn output_logged(cmd: &mut Command, what: &str) -> anyhow::Result<std::pro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1021,75 +893,6 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
     }
 
-    fn fixture() -> Value {
-        json!({
-            "devices": {
-                "com.apple.CoreSimulator.SimRuntime.iOS-18-2": [
-                    { "udid": "AAAA-18", "name": "iPhone 15 Pro Max",
-                      "state": "Shutdown", "isAvailable": true },
-                    { "udid": "BBBB-18", "name": "iPhone SE (3rd generation)",
-                      "state": "Booted", "isAvailable": true }
-                ],
-                "com.apple.CoreSimulator.SimRuntime.iOS-26-3": [
-                    { "udid": "CCCC-26", "name": "iPhone 15 Pro Max",
-                      "state": "Shutdown", "isAvailable": true },
-                    { "udid": "DDDD-26", "name": "iPhone 16 Pro",
-                      "state": "Shutdown", "isAvailable": false },
-                    { "udid": "EEEE-26", "name": "iPhone 16 Pro",
-                      "state": "Shutdown", "isAvailable": true }
-                ],
-                "com.apple.CoreSimulator.SimRuntime.watchOS-11-0": [
-                    { "udid": "WWWW", "name": "Apple Watch Ultra 2 (49mm)",
-                      "state": "Shutdown", "isAvailable": true }
-                ]
-            }
-        })
-    }
-
-    #[test]
-    fn name_match_prefers_newest_os() {
-        // Same name in iOS 18.2 and 26.3, none booted -> newest OS wins.
-        let udid = pick_device(&fixture(), Some("iPhone 15 Pro Max"), None).unwrap();
-        assert_eq!(udid, "CCCC-26");
-    }
-
-    #[test]
-    fn os_narrowing_selects_runtime() {
-        let udid = pick_device(&fixture(), Some("iPhone 15 Pro Max"), Some("18.2")).unwrap();
-        assert_eq!(udid, "AAAA-18");
-    }
-
-    #[test]
-    fn udid_match_and_case_insensitive_name() {
-        assert_eq!(
-            pick_device(&fixture(), Some("aaaa-18"), None).unwrap(),
-            "AAAA-18"
-        );
-        assert_eq!(
-            pick_device(&fixture(), Some("iphone 16 pro"), None).unwrap(),
-            "EEEE-26" // DDDD-26 is unavailable
-        );
-    }
-
-    #[test]
-    fn booted_query_matches_booted_device() {
-        assert_eq!(
-            pick_device(&fixture(), Some("booted"), None).unwrap(),
-            "BBBB-18"
-        );
-    }
-
-    #[test]
-    fn booted_preferred_over_newer_os() {
-        let mut v = fixture();
-        // Boot the iOS 18.2 iPhone 15 Pro Max; it must win over the 26.3 one.
-        v["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-18-2"][0]["state"] = json!("Booted");
-        assert_eq!(
-            pick_device(&v, Some("iPhone 15 Pro Max"), None).unwrap(),
-            "AAAA-18"
-        );
-    }
-
     #[test]
     fn boot_error_benign_for_already_booted_and_booting() {
         let msg = "An error was encountered processing the command \
@@ -1122,70 +925,6 @@ mod tests {
         ));
         assert!(!boot_error_is_retryable("Invalid device: 1234"));
         assert!(!boot_error_is_retryable(""));
-    }
-
-    #[test]
-    fn no_match_lists_devices() {
-        let err = pick_device(&fixture(), Some("iPhone 99"), None).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("no available simulator"));
-        assert!(msg.contains("iPhone 15 Pro Max"));
-    }
-
-    #[test]
-    fn missing_os_runtime_is_called_out() {
-        // The os filter excludes every runtime: instead of an empty
-        // "available devices" list, name the missing runtime.
-        let err = pick_device(&fixture(), Some("iPhone 15 Pro Max"), Some("99.0")).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("no iOS 99.0 simulator runtime is installed"));
-        assert!(!msg.contains("available devices"));
-    }
-
-    #[test]
-    fn default_prefers_booted_iphone() {
-        // No query: the booted iPhone SE (iOS 18.2) wins over every
-        // shutdown iPhone on a newer OS.
-        assert_eq!(pick_device(&fixture(), None, None).unwrap(), "BBBB-18");
-    }
-
-    #[test]
-    fn default_none_booted_picks_newest_iphone() {
-        let mut v = fixture();
-        v["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-18-2"][1]["state"] = json!("Shutdown");
-        // Nothing booted -> newest OS (26.3); within it the name-descending
-        // tie-break picks "iPhone 16 Pro" over "iPhone 15 Pro Max"
-        // (DDDD-26 is unavailable, so EEEE-26).
-        assert_eq!(pick_device(&v, None, None).unwrap(), "EEEE-26");
-    }
-
-    #[test]
-    fn default_ignores_booted_non_iphone() {
-        let mut v = fixture();
-        v["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-18-2"][1]["state"] = json!("Shutdown");
-        // A booted iPad must not be picked by the iPhone default.
-        v["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-3"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({ "udid": "IPAD-26", "name": "iPad Pro 13-inch (M4)",
-                          "state": "Booted", "isAvailable": true }));
-        assert_eq!(pick_device(&v, None, None).unwrap(), "EEEE-26");
-    }
-
-    #[test]
-    fn default_no_iphone_lists_devices() {
-        let v = json!({
-            "devices": {
-                "com.apple.CoreSimulator.SimRuntime.iOS-26-3": [
-                    { "udid": "IPAD-26", "name": "iPad Pro 13-inch (M4)",
-                      "state": "Shutdown", "isAvailable": true }
-                ]
-            }
-        });
-        let err = pick_device(&v, None, None).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("no \"device\" configured"));
-        assert!(msg.contains("iPad Pro 13-inch (M4)"));
     }
 
     #[test]
@@ -1334,17 +1073,5 @@ mod tests {
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].0, "SIMCTL_CHILD_NSUnbufferedIO");
         assert_eq!(envs[0].1, Some(std::ffi::OsStr::new("YES")));
-    }
-
-    #[test]
-    fn runtime_version_parsing() {
-        assert_eq!(
-            runtime_version("com.apple.CoreSimulator.SimRuntime.iOS-26-3"),
-            (26, 3)
-        );
-        assert_eq!(
-            runtime_version("com.apple.CoreSimulator.SimRuntime.iOS-9-0"),
-            (9, 0)
-        );
     }
 }

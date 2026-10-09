@@ -21,6 +21,7 @@
 //!   attaches lldb-dap to a locally compiled dummy process, exercising the
 //!   whole DAP flow without Xcode in seconds.
 
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,7 +41,7 @@ use crate::dap::lldb::LldbDap;
 use crate::dap::peek::{self, ChildMsg, ClientMsg};
 use crate::engine::consoles::{self, Tailers};
 use crate::engine::pipeline::{self, LaunchedApp, OutputSink};
-use crate::engine::simctl;
+use crate::engine::{config, project, selection, simctl};
 use crate::util::logging;
 use crate::util::pidfile;
 
@@ -743,9 +744,14 @@ impl Proxy {
                 let _ = pipe_tx.send(res).await;
             });
         } else {
-            let cfg: LaunchConfig = match serde_json::from_value(args) {
+            let cfg: LaunchConfig = match serde_json::from_value(args.clone()) {
                 Ok(cfg) => cfg,
-                Err(e) => return self.fail_launch(&format!("invalid launch configuration: {e}")),
+                Err(e) => {
+                    return self.fail_launch(&format!(
+                        "invalid launch configuration: {}",
+                        config::invalid_config_reason(&args, &e)
+                    ))
+                }
             };
             // Raise (never lower) the log level for this session. Skipped
             // when init installed no logger — raising the level would only
@@ -764,10 +770,10 @@ impl Proxy {
                 log_frame("zed->proxy [replayed after verboseLogging raise]", raw);
             }
             log::info!(
-                "launch intercepted (seq {seq}): workspace {}, scheme {:?}, device {:?}, \
+                "launch intercepted (seq {seq}): workspace {:?}, scheme {:?}, device {:?}, \
                  os {:?}, configuration {:?}, preflight {}, oslog {}, buildOutput {:?}, \
                  terminateOnStop {}",
-                cfg.workspace.display(),
+                cfg.workspace,
                 cfg.scheme,
                 cfg.device,
                 cfg.os,
@@ -777,8 +783,14 @@ impl Proxy {
                 cfg.build_output,
                 cfg.terminate_on_stop,
             );
+            // Zed starts the adapter in the worktree root: the project root,
+            // whose selection store the pipeline reads on every launch.
+            let root = std::env::current_dir()
+                .map(|cwd| project::root_from_zed(&cwd))
+                .unwrap_or_else(|_| PathBuf::from("."));
+            let req = selection::Request::for_launch(&cfg, root);
             tokio::spawn(async move {
-                let res = pipeline::run_pipeline(&cfg, true, &sink, cancel)
+                let res = pipeline::run_pipeline(&req, true, &sink, cancel)
                     .await
                     .map(|app| PipelineDone {
                         app,

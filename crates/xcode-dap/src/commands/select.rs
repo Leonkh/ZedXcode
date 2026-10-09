@@ -1,6 +1,6 @@
 //! `xcode-dap select-scheme` / `select-device` — Xcode-like scheme and
-//! destination pickers for a Zed task terminal. Both write the runtime
-//! selection overlay (`.zed/.zedx/selection.json`, see `engine/selection.rs`)
+//! destination pickers for a Zed task terminal. Both write the project's
+//! selection store (`.zed/.zedx/selection.json`, see `engine/selection.rs`),
 //! which the engine re-reads on every build/run/clean and DAP launch, so a
 //! new selection applies to the next cmd-r / cmd-b without touching
 //! `.zed/debug.json` or `.zed/tasks.json`.
@@ -11,22 +11,17 @@
 //! Non-interactive paths: `--set <name>` and `--list`.
 
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use tokio::process::Command;
 
-use super::refresh;
-use crate::engine::pipeline::zedxcode_home;
-use crate::engine::project;
-use crate::engine::selection;
+use crate::commands::build::{cli_root, CliSink};
+use crate::engine::destinations::{self, Query};
+use crate::engine::schemes;
+use crate::engine::selection::{self, StoredDestination};
 use crate::setup::build_server::{regenerate, Regen};
-use crate::setup::jsonc;
 use crate::setup::project::{build_server_opted_in, git_exclude_build_server};
-use crate::util::hash::fnv1a64;
-use crate::util::paths::container_flag;
+use crate::util::paths::expand_worktree_root;
 
 // ---------------------------------------------------------------------------
 // select-scheme
@@ -46,12 +41,9 @@ pub struct SelectSchemeArgs {
 }
 
 pub async fn run_select_scheme(args: SelectSchemeArgs) -> Result<()> {
-    let project = project_dir()?;
-    let workspace = match args.workspace {
-        Some(w) => std::path::absolute(&w).unwrap_or(w),
-        None => find_workspace(&project)?,
-    };
-    let schemes = list_schemes(&workspace).await?;
+    let project = cli_root()?;
+    let workspace = selection::cli_container(&project, args.workspace.as_deref())?;
+    let schemes = schemes::list(&workspace, &CliSink).await?.schemes;
 
     if args.list {
         for s in &schemes {
@@ -113,9 +105,7 @@ pub async fn run_select_scheme(args: SelectSchemeArgs) -> Result<()> {
         }
     };
 
-    let mut sel = selection::load(&project);
-    sel.scheme = Some(chosen.clone());
-    let path = selection::save(&project, &sel)?;
+    let path = selection::update(&project, |store| store.choose_scheme(&chosen))?;
     println!("✓ Scheme: {chosen}");
     println!(
         "  Saved to {} — applies to the next build/run (cmd-b / cmd-r).",
@@ -135,8 +125,11 @@ pub async fn run_select_scheme(args: SelectSchemeArgs) -> Result<()> {
         // (not the cwd — select-scheme can run from a subdirectory), the same
         // way `refresh` handles this field. Passing it raw would make
         // resolve_build_root record a bogus build_root in buildServer.json.
-        let derived_data = debug_json_str(&project, "derivedData")
-            .map(|d| refresh::expand_worktree_root(&d, &project));
+        let derived_data = selection::first_xcode_scenario(&project)
+            .ok()
+            .flatten()
+            .and_then(|s| s.derived_data)
+            .map(|d| expand_worktree_root(&d.to_string_lossy(), &project));
         let dd = derived_data.as_deref();
         if let Regen::Written(outcome) = regenerate(&project, &workspace, &chosen, None, dd).await {
             if outcome.first_create() {
@@ -171,8 +164,9 @@ pub struct SelectDeviceArgs {
 }
 
 pub async fn run_select_device(args: SelectDeviceArgs) -> Result<()> {
-    let project = project_dir()?;
-    let devices = list_devices().await?;
+    let project = cli_root()?;
+    let inventory = destinations::inventory().await?;
+    let devices = inventory.devices();
     if devices.is_empty() {
         bail!(
             "no available iPhone/iPad simulators found — install a simulator \
@@ -181,11 +175,11 @@ pub async fn run_select_device(args: SelectDeviceArgs) -> Result<()> {
     }
 
     if args.list {
-        for d in &devices {
+        for d in devices {
             println!(
                 "{} — iOS {} — {}{}",
                 d.name,
-                d.os,
+                d.os_version(),
                 d.udid,
                 if d.booted { " (booted)" } else { "" }
             );
@@ -193,25 +187,29 @@ pub async fn run_select_device(args: SelectDeviceArgs) -> Result<()> {
         return Ok(());
     }
 
-    let chosen: SimDevice = if let Some(query) = args.set {
-        match find_device(&devices, &query) {
-            Some(d) => d.clone(),
-            None => bail!(
-                "no simulator matching \"{query}\" — run \
+    let chosen = if let Some(query) = args.set {
+        let query = Query::legacy(Some(&query), None).expect("a device was given");
+        match destinations::resolve(Some(&query), &inventory, "--set") {
+            Ok(resolved) => resolved.device,
+            Err(_) => bail!(
+                "no simulator matching \"{}\" — run \
                  `xcode-dap select-device --list` to see what is available \
-                 (names, UDIDs, or \"booted\" work)"
+                 (names, UDIDs, or \"booted\" work)",
+                query.label()
             ),
         }
     } else {
-        let current = current_destination(&project);
+        // The simulator a build would use now, marked as current.
+        let picks = selection::current(&project);
+        let current = selection::settle_destination(picks.destination.as_ref(), &inventory)
+            .ok()
+            .map(|(device, _)| device.value.udid);
         let items: Vec<Item> = devices
             .iter()
             .map(|d| Item {
-                label: format!("{} — iOS {}", d.name, d.os),
+                label: format!("{} — iOS {}", d.name, d.os_version()),
                 marked: d.booted,
-                current: current
-                    .as_ref()
-                    .is_some_and(|(dev, os)| device_matches(d, dev, os.as_deref())),
+                current: current.as_deref() == Some(d.udid.as_str()),
             })
             .collect();
         println!("{} simulators (● = booted):", items.len());
@@ -224,22 +222,12 @@ pub async fn run_select_device(args: SelectDeviceArgs) -> Result<()> {
         }
     };
 
-    // Persist name + os (human-readable, survives device re-creation); fall
-    // back to the UDID only when the (name, os) pair is ambiguous.
-    let ambiguous = devices
-        .iter()
-        .filter(|d| d.name == chosen.name && d.os == chosen.os)
-        .count()
-        > 1;
-    let mut sel = selection::load(&project);
-    sel.device = Some(if ambiguous {
-        chosen.udid.clone()
-    } else {
-        chosen.name.clone()
-    });
-    sel.os = Some(chosen.os.clone());
-    let path = selection::save(&project, &sel)?;
-    println!("✓ Destination: {} (iOS {})", chosen.name, chosen.os);
+    // UDID, name and OS: the UDID first, and the name and OS when the
+    // simulator is deleted and made again.
+    let path = selection::update(&project, |store| {
+        store.choose_destination(StoredDestination::simulator(&chosen))
+    })?;
+    println!("✓ Destination: {}", chosen.label());
     println!(
         "  Saved to {} — applies to the next build/run (cmd-b / cmd-r).",
         path.display()
@@ -248,271 +236,14 @@ pub async fn run_select_device(args: SelectDeviceArgs) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// project / current-selection helpers
+// current-selection helpers
 // ---------------------------------------------------------------------------
 
-fn project_dir() -> Result<PathBuf> {
-    selection::find_project_dir_from_cwd().with_context(|| {
-        format!(
-            "this doesn't look like a Zed project: no .zed/ directory found \
-             in {} or any parent — run this from your project (or run \
-             `xcode-dap setup --project .` there first)",
-            std::env::current_dir()
-                .map(|d| d.display().to_string())
-                .unwrap_or_else(|_| "the current directory".into())
-        )
-    })
-}
-
-/// The container [`project::discover`] finds within two levels of the
-/// project root (absolute). A tie or no container points at `--workspace`,
-/// which skips this search.
-fn find_workspace(project: &Path) -> Result<PathBuf> {
-    Ok(project::container_for_cli(project)?.path)
-}
-
-/// Current scheme for the "(current)" marker: the overlay's scheme, else the
-/// `.zed/debug.json` scenario's (best-effort). Also the effective scheme
-/// `doctor` compares buildServer.json against.
-pub(crate) fn current_scheme(project: &Path) -> Option<String> {
-    selection::load(project)
-        .scheme
-        .or_else(|| debug_json_str(project, "scheme"))
-}
-
-/// Current destination (`device`, `os`) for the "(current)" marker.
-fn current_destination(project: &Path) -> Option<(String, Option<String>)> {
-    let sel = selection::load(project);
-    if let Some(device) = sel.device {
-        return Some((device, sel.os));
-    }
-    debug_json_str(project, "device").map(|d| (d, debug_json_str(project, "os")))
-}
-
-/// Best-effort string field from the first `"Xcode"` scenario in
-/// `.zed/debug.json` (other adapters' scenarios are ignored, matching
-/// `refresh`'s scenario lookup).
-fn debug_json_str(project: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(project.join(".zed").join("debug.json")).ok()?;
-    let v = jsonc::parse_jsonc(&text).ok()?;
-    v.as_array()?
-        .iter()
-        .filter(|s| s.get("adapter").and_then(Value::as_str) == Some("Xcode"))
-        .find_map(|s| s.get(key)?.as_str().map(str::to_owned))
-}
-
-// ---------------------------------------------------------------------------
-// scheme listing (xcodebuild -list -json, mtime-keyed cache)
-// ---------------------------------------------------------------------------
-
-#[derive(Serialize, Deserialize)]
-struct SchemesCache {
-    workspace_mtime: u64,
-    schemes: Vec<String>,
-}
-
-/// Schemes of `workspace`, cached in
-/// `~/.zedxcode/cache/schemes-<hash>.json` keyed on the workspace mtime
-/// (`xcodebuild -list` takes ~10s+ on large workspaces — they can have
-/// hundreds of schemes — and the list only changes on project
-/// regeneration). Deleting `~/.zedxcode/cache` clears the cache.
-async fn list_schemes(workspace: &Path) -> Result<Vec<String>> {
-    let ws = std::path::absolute(workspace).unwrap_or_else(|_| workspace.to_path_buf());
-    let mtime = workspace_mtime(&ws).with_context(|| {
-        format!(
-            "workspace {} does not exist — generate the project first \
-             (e.g. `make project CI=true`) or pass --workspace",
-            ws.display()
-        )
-    })?;
-
-    let cache_dir = zedxcode_home()?.join("cache");
-    std::fs::create_dir_all(&cache_dir)
-        .with_context(|| format!("creating {}", cache_dir.display()))?;
-    let cache_file = cache_dir.join(format!(
-        "schemes-{:016x}.json",
-        fnv1a64(ws.as_os_str().as_encoded_bytes())
-    ));
-    if let Some(cache) = std::fs::read(&cache_file)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<SchemesCache>(&b).ok())
-    {
-        if cache.workspace_mtime == mtime && !cache.schemes.is_empty() {
-            return Ok(cache.schemes);
-        }
-    }
-
-    eprintln!("Listing schemes via `xcodebuild -list` (slow the first time, then cached)...");
-    let out = Command::new("xcodebuild")
-        .args(["-list", "-json", container_flag(&ws)])
-        .arg(&ws)
-        .kill_on_drop(true)
-        .output()
-        .await
-        .context("failed to run `xcodebuild -list` — is Xcode installed?")?;
-    if !out.status.success() {
-        bail!(
-            "`xcodebuild -list` failed for {}:\n{}",
-            ws.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let schemes = parse_schemes(&out.stdout)
-        .with_context(|| format!("unexpected `xcodebuild -list` output for {}", ws.display()))?;
-
-    let _ = serde_json::to_vec(&SchemesCache {
-        workspace_mtime: mtime,
-        schemes: schemes.clone(),
-    })
-    .map(|bytes| std::fs::write(&cache_file, bytes)); // best-effort cache
-    Ok(schemes)
-}
-
-/// `xcodebuild -list -json` stdout -> scheme names.
-fn parse_schemes(bytes: &[u8]) -> Result<Vec<String>> {
-    let v: Value = serde_json::from_slice(bytes).context("output is not JSON")?;
-    let schemes: Vec<String> = v
-        .get("workspace")
-        .or_else(|| v.get("project"))
-        .and_then(|c| c.get("schemes"))
-        .and_then(Value::as_array)
-        .context("no `schemes` array in output")?
-        .iter()
-        .filter_map(|s| s.as_str().map(str::to_owned))
-        .collect();
-    if schemes.is_empty() {
-        bail!("the scheme list is empty");
-    }
-    Ok(schemes)
-}
-
-fn path_mtime(p: &Path) -> Result<u64> {
-    let mtime = std::fs::metadata(p)?.modified()?;
-    Ok(mtime
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs())
-}
-
-/// Cache key: the newest of the container dir's own mtime and its
-/// `contents.xcworkspacedata` mtime. Tuist regenerates that file in place
-/// without bumping the directory mtime, so the dir mtime alone would keep
-/// serving a stale scheme list after regeneration (same freshness logic as
-/// `doctor`'s buildServer.json check). Errors when the container is missing.
-fn workspace_mtime(ws: &Path) -> Result<u64> {
-    let own = path_mtime(ws)?;
-    let contents = path_mtime(&ws.join("contents.xcworkspacedata")).unwrap_or(0);
-    Ok(own.max(contents))
-}
-
-// ---------------------------------------------------------------------------
-// device listing (simctl list devices --json)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SimDevice {
-    name: String,
-    udid: String,
-    /// "26.3"
-    os: String,
-    version: (u32, u32),
-    booted: bool,
-}
-
-async fn list_devices() -> Result<Vec<SimDevice>> {
-    let out = Command::new("xcrun")
-        .args(["simctl", "list", "devices", "--json"])
-        .kill_on_drop(true)
-        .output()
-        .await
-        .context("failed to run `xcrun simctl list devices` — is Xcode installed?")?;
-    if !out.status.success() {
-        bail!(
-            "`xcrun simctl list devices` failed:\n{}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let json: Value =
-        serde_json::from_slice(&out.stdout).context("simctl device list is not JSON")?;
-    Ok(parse_devices(&json))
-}
-
-/// Available iPhones + iPads from the parsed `simctl list devices --json`,
-/// sorted booted-first, then newest OS, then iPhones before iPads, then name.
-fn parse_devices(json: &Value) -> Vec<SimDevice> {
-    let Some(devices) = json.get("devices").and_then(Value::as_object) else {
-        return vec![];
-    };
-    let mut out: Vec<SimDevice> = Vec::new();
-    for (runtime, devs) in devices {
-        // iOS runtimes only; "...SimRuntime.iOS-26-3" -> "26.3".
-        let Some(os) = runtime
-            .rsplit('.')
-            .next()
-            .and_then(|r| r.strip_prefix("iOS-"))
-            .map(|r| r.replace('-', "."))
-        else {
-            continue;
-        };
-        let mut parts = os.split('.').filter_map(|p| p.parse::<u32>().ok());
-        let version = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
-        let Some(arr) = devs.as_array() else { continue };
-        for d in arr {
-            if !d
-                .get("isAvailable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let (Some(udid), Some(name), Some(state)) = (
-                d.get("udid").and_then(Value::as_str),
-                d.get("name").and_then(Value::as_str),
-                d.get("state").and_then(Value::as_str),
-            ) else {
-                continue;
-            };
-            if !(name.starts_with("iPhone") || name.starts_with("iPad")) {
-                continue;
-            }
-            out.push(SimDevice {
-                name: name.to_string(),
-                udid: udid.to_string(),
-                os: os.clone(),
-                version,
-                booted: state == "Booted",
-            });
-        }
-    }
-    out.sort_by(|a, b| {
-        b.booted
-            .cmp(&a.booted)
-            .then(b.version.cmp(&a.version))
-            .then(a.name.starts_with("iPad").cmp(&b.name.starts_with("iPad")))
-            .then(a.name.cmp(&b.name))
-            .then(a.udid.cmp(&b.udid))
-    });
-    out
-}
-
-/// `--set` resolution: UDID, exact name (first in sorted order wins, i.e.
-/// booted/newest), or the special query "booted".
-fn find_device<'a>(devices: &'a [SimDevice], query: &str) -> Option<&'a SimDevice> {
-    devices
-        .iter()
-        .find(|d| d.udid.eq_ignore_ascii_case(query))
-        .or_else(|| {
-            devices
-                .iter()
-                .find(|d| query.eq_ignore_ascii_case("booted") && d.booted)
-        })
-        .or_else(|| devices.iter().find(|d| d.name.eq_ignore_ascii_case(query)))
-}
-
-/// Does this device match a persisted/current `device` (+ optional `os`)?
-fn device_matches(d: &SimDevice, device: &str, os: Option<&str>) -> bool {
-    (device.eq_ignore_ascii_case(&d.name) || device.eq_ignore_ascii_case(&d.udid))
-        && os.is_none_or(|o| o == d.os)
+/// The scheme a build would use now, for the "(current)" marker: the store,
+/// the main checkout's store (a linked worktree), else the first Xcode
+/// scenario's. Also the scheme `doctor` compares buildServer.json against.
+pub(crate) fn current_scheme(project: &std::path::Path) -> Option<String> {
+    selection::current(project).scheme.map(|s| s.value)
 }
 
 // ---------------------------------------------------------------------------
@@ -618,21 +349,6 @@ fn pick_interactive(items: &[Item], what: &str) -> Result<Option<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-    use std::fs;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-    fn sandbox() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "zedxcode-select-test-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::SeqCst)
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     fn items(labels: &[&str]) -> Vec<Item> {
         labels
@@ -643,23 +359,6 @@ mod tests {
                 current: false,
             })
             .collect()
-    }
-
-    #[test]
-    fn find_workspace_searches_two_levels_and_names_a_tie() {
-        let dir = sandbox();
-        fs::create_dir_all(dir.join("ios/MyApp.xcworkspace")).unwrap();
-        fs::create_dir_all(dir.join("ios/MyApp.xcodeproj")).unwrap();
-        assert_eq!(
-            find_workspace(&dir).unwrap(),
-            dir.join("ios/MyApp.xcworkspace")
-        );
-        fs::create_dir_all(dir.join("watch/Watch.xcodeproj")).unwrap();
-        assert_eq!(
-            find_workspace(&dir).unwrap_err().to_string(),
-            "Found 2 Xcode workspaces and projects: ios/MyApp.xcworkspace, \
-             watch/Watch.xcodeproj. Pass --workspace to choose one."
-        );
     }
 
     #[test]
@@ -688,131 +387,5 @@ mod tests {
         assert_eq!(parse_input("0", 3), Input::Filter("0".into()));
         assert_eq!(parse_input("pro max", 3), Input::Filter("pro max".into()));
         assert_eq!(parse_input("", 3), Input::Filter(String::new()));
-    }
-
-    #[test]
-    fn schemes_parse_workspace_and_project_shapes() {
-        let ws = json!({ "workspace": { "name": "myapp", "schemes": ["A", "B"] } });
-        assert_eq!(
-            parse_schemes(serde_json::to_vec(&ws).unwrap().as_slice()).unwrap(),
-            vec!["A", "B"]
-        );
-        let proj = json!({ "project": { "name": "app", "schemes": ["Only"] } });
-        assert_eq!(
-            parse_schemes(serde_json::to_vec(&proj).unwrap().as_slice()).unwrap(),
-            vec!["Only"]
-        );
-        assert!(parse_schemes(b"not json").is_err());
-        let empty = json!({ "workspace": { "schemes": [] } });
-        assert!(parse_schemes(serde_json::to_vec(&empty).unwrap().as_slice()).is_err());
-    }
-
-    fn device_fixture() -> Value {
-        json!({
-            "devices": {
-                "com.apple.CoreSimulator.SimRuntime.iOS-18-2": [
-                    { "udid": "AAAA", "name": "iPhone 15 Pro Max",
-                      "state": "Shutdown", "isAvailable": true },
-                    { "udid": "BBBB", "name": "iPhone SE (3rd generation)",
-                      "state": "Booted", "isAvailable": true }
-                ],
-                "com.apple.CoreSimulator.SimRuntime.iOS-26-3": [
-                    { "udid": "CCCC", "name": "iPhone 16 Pro",
-                      "state": "Shutdown", "isAvailable": true },
-                    { "udid": "DDDD", "name": "iPad Pro 13-inch (M4)",
-                      "state": "Shutdown", "isAvailable": true },
-                    { "udid": "EEEE", "name": "iPhone 17", // unavailable
-                      "state": "Shutdown", "isAvailable": false }
-                ],
-                "com.apple.CoreSimulator.SimRuntime.watchOS-11-0": [
-                    { "udid": "WWWW", "name": "Apple Watch Ultra 2 (49mm)",
-                      "state": "Shutdown", "isAvailable": true }
-                ]
-            }
-        })
-    }
-
-    #[test]
-    fn devices_filtered_and_sorted_booted_then_newest_then_iphone_first() {
-        let devs = parse_devices(&device_fixture());
-        let order: Vec<(&str, &str, bool)> = devs
-            .iter()
-            .map(|d| (d.name.as_str(), d.os.as_str(), d.booted))
-            .collect();
-        assert_eq!(
-            order,
-            vec![
-                ("iPhone SE (3rd generation)", "18.2", true), // booted first
-                ("iPhone 16 Pro", "26.3", false),             // newest OS
-                ("iPad Pro 13-inch (M4)", "26.3", false),     // iPads after iPhones
-                ("iPhone 15 Pro Max", "18.2", false),
-            ]
-        );
-        // Unavailable device and watchOS runtime are excluded.
-        assert!(!devs.iter().any(|d| d.udid == "EEEE" || d.udid == "WWWW"));
-    }
-
-    #[test]
-    fn find_device_by_udid_name_and_booted() {
-        let devs = parse_devices(&device_fixture());
-        assert_eq!(find_device(&devs, "cccc").unwrap().name, "iPhone 16 Pro");
-        assert_eq!(
-            find_device(&devs, "iphone 15 pro max").unwrap().udid,
-            "AAAA"
-        );
-        assert_eq!(
-            find_device(&devs, "booted").unwrap().name,
-            "iPhone SE (3rd generation)"
-        );
-        assert!(find_device(&devs, "iPhone 99").is_none());
-    }
-
-    #[test]
-    fn device_matching_for_current_marker() {
-        let devs = parse_devices(&device_fixture());
-        let pro16 = devs.iter().find(|d| d.udid == "CCCC").unwrap();
-        assert!(device_matches(pro16, "iPhone 16 Pro", Some("26.3")));
-        assert!(device_matches(pro16, "iPhone 16 Pro", None));
-        assert!(device_matches(pro16, "CCCC", Some("26.3")));
-        assert!(!device_matches(pro16, "iPhone 16 Pro", Some("18.2")));
-        assert!(!device_matches(pro16, "iPhone 15 Pro Max", None));
-    }
-
-    #[test]
-    fn find_workspace_reports_ambiguous_projects_when_no_workspace() {
-        let dir = sandbox();
-        fs::create_dir(dir.join("a.xcodeproj")).unwrap();
-        fs::create_dir(dir.join("b.xcodeproj")).unwrap();
-        // No workspace + several projects: the error must list the actual
-        // ambiguous .xcodeproj candidates, not an empty workspace list.
-        let err = find_workspace(&dir).unwrap_err().to_string();
-        assert!(err.contains(".xcodeproj"), "{err}");
-        assert!(err.contains("a.xcodeproj, b.xcodeproj"), "{err}");
-        // A single workspace still wins over any number of projects.
-        fs::create_dir(dir.join("c.xcworkspace")).unwrap();
-        assert_eq!(find_workspace(&dir).unwrap(), dir.join("c.xcworkspace"));
-    }
-
-    #[test]
-    fn workspace_mtime_tracks_in_place_contents_rewrite() {
-        let ws = sandbox().join("myapp.xcworkspace");
-        fs::create_dir_all(&ws).unwrap();
-        let dir_only = workspace_mtime(&ws).unwrap();
-        // Tuist-style regeneration rewrites contents.xcworkspacedata in
-        // place; a newer contents mtime must bump the cache key even when
-        // the directory mtime is unchanged.
-        let contents = ws.join("contents.xcworkspacedata");
-        fs::write(&contents, "<Workspace/>").unwrap();
-        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
-        fs::File::options()
-            .write(true)
-            .open(&contents)
-            .unwrap()
-            .set_modified(future)
-            .unwrap();
-        assert!(workspace_mtime(&ws).unwrap() > dir_only);
-        // A missing container is an error (drives the "generate the
-        // project first" hint in list_schemes).
-        assert!(workspace_mtime(&sandbox().join("missing.xcworkspace")).is_err());
     }
 }

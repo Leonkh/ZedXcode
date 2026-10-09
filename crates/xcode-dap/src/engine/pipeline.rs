@@ -6,12 +6,15 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-use crate::engine::config::LaunchConfig;
-use crate::engine::{compile_store, selection, simctl, xcactivitylog, xcodebuild};
+use crate::engine::destinations::{self, Device};
+use crate::engine::project::{self, Project};
+use crate::engine::selection::{self, Options, Request};
+use crate::engine::xcodebuild::Target;
+use crate::engine::{compile_store, schemes, simctl, xcactivitylog, xcodebuild};
 use crate::setup::build_server::{write_build_server_json, Change};
 use crate::setup::project::{build_server_opted_in, git_exclude_build_server};
 use crate::util::paths::{buildserver_stale, mtime, workspace_mtime};
@@ -62,42 +65,126 @@ pub struct LaunchedApp {
     pub stderr_file: PathBuf,
 }
 
-/// Phases 1-4: preflight -> resolve simulator -> (optional pre-boot) ->
-/// build -> app path. Returns `(udid, app_path)`.
+/// What the pipeline works on once a [`Request`] is resolved and validated.
+#[derive(Debug)]
+pub struct Prepared {
+    pub target: Target,
+    /// The simulator; `None` when the caller did not ask for one (clean).
+    pub device: Option<Device>,
+}
+
+/// Resolve `req` (the project's container, the selection layers), run the
+/// scenario's preflight when the container is missing, then settle the
+/// scheme, the configuration and, with `destination`, the simulator: all
+/// three after any generating preflight and before anything boots. One
+/// `Scheme: … | Destination: … | Configuration: …` line goes to `sink`.
+pub async fn prepare(
+    req: &Request,
+    sink: &dyn OutputSink,
+    cancel: &CancellationToken,
+    destination: bool,
+) -> anyhow::Result<Prepared> {
+    let resolution = selection::resolve(req)?;
+    for warning in &resolution.picks.warnings {
+        sink.line("console", warning);
+    }
+    let picks = &resolution.picks;
+    let container = ensure_container(&resolution.project, &req.options, sink, cancel).await?;
+
+    // The scheme list is cached per container; a cache miss runs
+    // `xcodebuild -list`, which a Stop must not wait out.
+    let list = unless_cancelled(
+        cancel,
+        "reading the scheme list",
+        schemes::list(&container, sink),
+    )
+    .await;
+    let list = match list {
+        Ok(list) => Some(list),
+        // A chosen scheme still builds when the list cannot be read:
+        // xcodebuild reports a wrong one itself.
+        Err(e) if picks.scheme.is_some() && !cancel.is_cancelled() => {
+            log::warn!(target: "pipeline", "scheme list unavailable: {e:#}");
+            sink.line(
+                "console",
+                &format!("Could not read the scheme list, so the scheme is not checked: {e:#}"),
+            );
+            None
+        }
+        Err(e) => return Err(e),
+    };
+    let (scheme, configuration) = match &list {
+        Some(list) => (
+            selection::settle_scheme(picks.scheme.as_ref(), list, &container)?,
+            selection::settle_configuration(picks.configuration.as_ref(), list, &container)?,
+        ),
+        None => (
+            picks.scheme.clone().expect("checked above"),
+            picks.configuration.clone(),
+        ),
+    };
+
+    // `simctl list` hangs while CoreSimulatorService restarts; a Stop must
+    // not wait for it.
+    let device = if destination {
+        let inventory =
+            unless_cancelled(cancel, "resolving the simulator", destinations::inventory()).await?;
+        let (device, warnings) =
+            selection::settle_destination(picks.destination.as_ref(), &inventory)?;
+        for warning in &warnings {
+            sink.line("console", warning);
+        }
+        Some(device)
+    } else {
+        None
+    };
+
+    let summary = selection::summary(&scheme, device.as_ref(), configuration.as_ref());
+    log::info!(target: "pipeline", "{summary}");
+    sink.line("console", &summary);
+    Ok(Prepared {
+        target: Target {
+            workspace: container,
+            scheme: scheme.value,
+            configuration: configuration.map(|c| c.value),
+            derived_data: req.options.derived_data.clone(),
+            build_output: req.options.build_output,
+        },
+        device: device.map(|d| d.value),
+    })
+}
+
+/// Phases 1-4: resolve and validate (with the preflight), then build and
+/// locate the app. Returns `(udid, app_path)`.
 ///
 /// This is the whole `xcode-dap build` command (`boot: false` — building
 /// for a `-destination ...,id=<udid>` does not require a booted device).
 pub async fn run_build(
-    cfg: &LaunchConfig,
+    req: &Request,
     sink: &dyn OutputSink,
     cancel: CancellationToken,
 ) -> anyhow::Result<(String, PathBuf)> {
-    // The runtime selection overlay (select-scheme / select-device) is
-    // re-read from disk on every entry, so a new selection applies to the
-    // very next build without touching .zed/debug.json or tasks.json.
-    let cfg = selection::overlaid(cfg, sink);
-    build_phases(&cfg, sink, cancel, false).await
+    // The selection store is re-read on every entry, so a new pick applies
+    // to the very next build without touching .zed/debug.json or tasks.json.
+    let prepared = prepare(req, sink, &cancel, true).await?;
+    build_phases(&prepared, sink, cancel, false).await
 }
 
 async fn build_phases(
-    cfg: &LaunchConfig,
+    prepared: &Prepared,
     sink: &dyn OutputSink,
     cancel: CancellationToken,
     boot: bool,
 ) -> anyhow::Result<(String, PathBuf)> {
-    // Phase 1: preflight (only if the workspace is missing).
-    preflight(cfg, sink, &cancel).await?;
-
-    // Phase 2: resolve simulator (+ visible pre-boot for run/debug).
-    // `simctl list` hangs while CoreSimulatorService restarts; a Stop must
-    // not wait for it.
-    let udid = unless_cancelled(
-        &cancel,
-        "resolving the simulator",
-        simctl::resolve_device(cfg.device.as_deref(), cfg.os.as_deref()),
-    )
-    .await?;
+    let cfg = &prepared.target;
+    let udid = prepared
+        .device
+        .as_ref()
+        .map(|d| d.udid.clone())
+        .context("no simulator was resolved")?;
     sink.line("console", &format!("Simulator: {udid}"));
+
+    // Phase 2: visible pre-boot for run/debug.
     if boot {
         sink.line("console", "Booting simulator (visible)...");
         tokio::select! {
@@ -156,7 +243,7 @@ async fn build_phases(
 /// covers Xcode.app builds; this covers `xcode-dap build`/`run`. Gated by the
 /// same opt-in as the buildServer regen (never create a store for a repo that
 /// never configured this adapter) and best-effort — it never fails the build.
-fn ingest_build_log(cfg: &LaunchConfig, app: &Path) {
+fn ingest_build_log(cfg: &Target, app: &Path) {
     let Ok(ws) = std::path::absolute(&cfg.workspace) else {
         return;
     };
@@ -208,15 +295,15 @@ fn ingest_build_log(cfg: &LaunchConfig, app: &Path) {
 /// while locating the app, installing and launching (the helper is dropped,
 /// which kills it; a cancelled debug launch also terminates the app).
 pub async fn run_pipeline(
-    cfg: &LaunchConfig,
+    req: &Request,
     debug: bool,
     sink: &dyn OutputSink,
     cancel: CancellationToken,
 ) -> anyhow::Result<LaunchedApp> {
-    // Selection overlay first (see run_build): in DAP mode this runs on
-    // every `launch`, including Zed's Rerun of a stale in-memory scenario.
-    let cfg = &selection::overlaid(cfg, sink);
-    let (udid, app_path) = build_phases(cfg, sink, cancel.clone(), true).await?;
+    // The selection store is read on every `launch` (see run_build),
+    // including Zed's Rerun of a stale in-memory scenario.
+    let prepared = prepare(req, sink, &cancel, true).await?;
+    let (udid, app_path) = build_phases(&prepared, sink, cancel.clone(), true).await?;
 
     // In DAP mode, supersede any previous session on this simulator BEFORE
     // installing: on the simulator `simctl install` blocks while that session's
@@ -335,61 +422,91 @@ async fn unless_cancelled<T>(
     }
 }
 
-/// Phase 1: if the workspace is missing and a preflight command is
-/// configured, run it verbatim via `sh -c` (e.g. for a Makefile-based
-/// Tuist project, setup writes `make project CI=true`). The binary never
-/// invents a command. Cancellation kills the preflight process group.
-async fn preflight(
-    cfg: &LaunchConfig,
+/// Phase 1: the container to build, generating it first when it is missing
+/// and the scenario configures a preflight. The preflight runs verbatim via
+/// `sh -c` (e.g. `xcodegen generate`); the binary never invents a command.
+/// Cancellation kills the preflight process group.
+async fn ensure_container(
+    project: &Project,
+    options: &Options,
+    sink: &dyn OutputSink,
+    cancel: &CancellationToken,
+) -> anyhow::Result<PathBuf> {
+    if let Some(container) = &project.container {
+        let workspace = &container.path;
+        if workspace.exists() {
+            log::info!(
+                target: "pipeline",
+                "preflight skipped: workspace {} exists",
+                workspace.display()
+            );
+            return Ok(workspace.clone());
+        }
+        let Some(preflight) = options.preflight.as_deref() else {
+            bail!(
+                "workspace {} not found and no \"preflight\" command is configured \
+                 to generate it\nhint: generate the project first (e.g. `xcodegen \
+                 generate` or `tuist generate --no-open`), set \"preflight\" in \
+                 .zed/debug.json, or fix the path via --workspace / the \"workspace\" \
+                 key; `xcode-dap refresh` regenerates and refreshes go-to-definition",
+                workspace.display()
+            );
+        };
+        let missing = format!("Workspace {} missing", workspace.display());
+        let cwd = workspace.parent().filter(|p| p.is_dir());
+        run_preflight(preflight, &missing, cwd, sink, cancel).await?;
+        if !workspace.exists() {
+            bail!(
+                "preflight `{preflight}` completed but workspace {} still does \
+                 not exist",
+                workspace.display()
+            );
+        }
+        return Ok(workspace.clone());
+    }
+    // Nothing found: without a preflight, say why (no project at all, or one
+    // its generator has not written yet).
+    let Some(preflight) = options.preflight.as_deref() else {
+        return project.require_container().map(|c| c.path.clone());
+    };
+    let missing = format!("No Xcode project in {} yet", project.root.display());
+    let cwd = project
+        .generator
+        .as_ref()
+        .map_or(project.root.as_path(), |g| g.dir.as_path());
+    run_preflight(preflight, &missing, Some(cwd), sink, cancel).await?;
+    let generated = project::discover(&project.root).map_err(|tie| anyhow!(tie))?;
+    match generated.container {
+        Some(container) => Ok(container.path),
+        None => bail!(
+            "preflight `{preflight}` completed but no .xcworkspace or .xcodeproj appeared in {}",
+            project.root.display()
+        ),
+    }
+}
+
+/// Run `preflight` in `cwd` (the process cwd when `None`), its output
+/// streamed to `sink`. `missing` says what it is for.
+async fn run_preflight(
+    preflight: &str,
+    missing: &str,
+    cwd: Option<&Path>,
     sink: &dyn OutputSink,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
-    if cfg.workspace.exists() {
-        log::info!(
-            target: "pipeline",
-            "preflight skipped: workspace {} exists",
-            cfg.workspace.display()
-        );
-        return Ok(());
-    }
-    let Some(preflight) = cfg.preflight.as_deref() else {
-        bail!(
-            "workspace {} not found and no \"preflight\" command is configured \
-             to generate it\nhint: generate the project first (e.g. `make project \
-             CI=true` for Tuist setups), set \"preflight\" in .zed/debug.json, \
-             or fix the path via --workspace / the \"workspace\" key; \
-             `xcode-dap refresh` regenerates and refreshes go-to-definition",
-            cfg.workspace.display()
-        );
-    };
-    log::info!(
-        target: "pipeline",
-        "preflight: workspace {} missing — running `{preflight}`",
-        cfg.workspace.display()
-    );
+    log::info!(target: "pipeline", "preflight: {missing} — running `{preflight}`");
     sink.line(
         "console",
-        &format!(
-            "Workspace {} missing — running preflight: {preflight}",
-            cfg.workspace.display()
-        ),
+        &format!("{missing} — running preflight: {preflight}"),
     );
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(preflight);
-    if let Some(dir) = cfg.workspace.parent().filter(|p| p.is_dir()) {
+    if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
     stream_to_sink(cmd, sink, cancel)
         .await
-        .with_context(|| format!("preflight `{preflight}` failed"))?;
-    if !cfg.workspace.exists() {
-        bail!(
-            "preflight `{preflight}` completed but workspace {} still does \
-             not exist",
-            cfg.workspace.display()
-        );
-    }
-    Ok(())
+        .with_context(|| format!("preflight `{preflight}` failed"))
 }
 
 /// Regenerate `<workspace-parent>/buildServer.json` when it is missing or
@@ -414,7 +531,7 @@ async fn preflight(
 /// calls. Errors only on cancellation (a Stop mid-regen must not delay the
 /// disconnect by the settings resolution's runtime).
 async fn ensure_build_server(
-    cfg: &LaunchConfig,
+    cfg: &Target,
     sink: &dyn OutputSink,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {

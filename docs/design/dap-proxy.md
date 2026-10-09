@@ -46,11 +46,13 @@ ZedXcode/
 │       │   ├── pipeline.rs         # preflight→buildServer→build→install→launch→pid→ingest (shared by dap + CLI)
 │       │   ├── project.rs          # project root, container and generator discovery (two levels deep), git worktree info
 │       │   ├── xcodebuild.rs       # build/clean/showBuildSettings, output filter/throttle
-│       │   ├── simctl.rs           # device resolution, boot, install, launch, terminate, pid fallback
+│       │   ├── schemes.rs          # schemes + configurations via `xcodebuild -list -json`, cached on every xcschemes/ mtime
+│       │   ├── destinations.rs     # one simulator inventory, destination resolution (UDID first, lenient OS), the automatic rule
+│       │   ├── simctl.rs           # device list, boot, install, launch, terminate, pid fallback
 │       │   ├── consoles.rs         # stdout/stderr file tailers, optional oslog pump
 │       │   ├── compile_store.rs    # persistent per-(build_root,scheme) compile-args store (bsp)
 │       │   ├── xcactivitylog.rs    # parse Xcode's .xcactivitylog build logs into compile args
-│       │   └── selection.rs        # .zed/.zedx/selection.json scheme/device overlay
+│       │   └── selection.rs        # selection store v2 (.zed/.zedx/selection.json) + resolve(): flags, store, main checkout's store, scenario keys, automatic
 │       ├── bsp/
 │       │   ├── mod.rs
 │       │   ├── server.rs           # sourcekit-lsp Build Server (`xcode-dap bsp`)
@@ -181,8 +183,8 @@ app stdout/stderr tailers ─▶ output events (category "stdout"/"stderr"), int
 
 ```rust
 pub struct LaunchConfig {              // = flattened scenario `config` from Zed
-    pub workspace: PathBuf,            // YourApp.xcworkspace (or project)
-    pub scheme: String,                // "YourApp"
+    pub workspace: Option<PathBuf>,    // YourApp.xcworkspace (or project); None = found two levels deep
+    pub scheme: Option<String>,        // legacy "YourApp", below the selection store; None = the only scheme
     pub device: Option<String>,        // "iPhone 15 Pro Max" | udid; None = booted iPhone, else newest available
     pub os: Option<String>,            // "26.3" — optional narrowing
     pub configuration: Option<String>,
@@ -241,7 +243,7 @@ Verified: **no clear-console action exists** in Zed's debugger (console namespac
 | `run` | Phases 1–8 without debugger: launch *without* `--wait-for-debugger`, stream console to terminal |
 | `clean` | `xcodebuild -workspace … -scheme … clean` (CMD+Shift+K task) |
 | `console [-f/--follow]` | Print (or tail) the current run's app console logs from `~/.zedxcode/run/<udid>/{out,err}.log` |
-| `select-scheme` / `select-device` | Interactive pickers (or `--set`/`--list`) writing the `.zed/.zedx/selection.json` overlay used by the next run; `select-scheme` also regenerates `buildServer.json` for the new scheme |
+| `select-scheme` / `select-device` | Interactive pickers (or `--set`/`--list`) writing the selection store `.zed/.zedx/selection.json` that the next run reads; `select-scheme` also regenerates `buildServer.json` for the new scheme |
 | `setup [--project <dir>] [--user] [--yes]` | §6.1 |
 | `refresh` | Re-run preflight (Tuist project regeneration) + touch buildServer.json + print "restart LSP" hint (`editor: restart language server`) |
 | `doctor` | Checks: Xcode + `xcrun -f lldb-dap`, simctl works, requested sim exists/booted, sourcekit-lsp, `buildServer.json` present + fresh + `argv` launching the built-in `bsp` server + recorded `build_root`/scheme still valid, compile-store health, rustup (dev), pidfile staleness, binary version vs extension expectation |

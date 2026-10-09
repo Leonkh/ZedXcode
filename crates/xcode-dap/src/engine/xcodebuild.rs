@@ -18,7 +18,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::engine::config::{BuildOutput, LaunchConfig};
+use crate::engine::config::BuildOutput;
 use crate::engine::pipeline::OutputSink;
 use crate::setup::project::shell_quote;
 use crate::util::logging;
@@ -57,10 +57,23 @@ impl std::error::Error for BuildFailed {}
 /// How many trailing `error:` lines [`BuildFailed`] keeps.
 const MAX_ERROR_LINES: usize = 5;
 
+/// What xcodebuild builds, cleans or reads the settings of: the resolved
+/// container, scheme and configuration, and the build options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    /// The `.xcworkspace` or `.xcodeproj`, absolute.
+    pub workspace: PathBuf,
+    pub scheme: String,
+    /// `None` = the scheme's own configuration.
+    pub configuration: Option<String>,
+    pub derived_data: Option<PathBuf>,
+    pub build_output: BuildOutput,
+}
+
 /// `xcodebuild <container-flag> <workspace> -scheme <scheme> [-configuration
 /// <c>] [-derivedDataPath <dd>]` — the shared prefix for build / clean /
 /// showBuildSettings. Split out from [`base_cmd`] so [`resolve_build_root`]
-/// (which has no full [`LaunchConfig`]) reuses the exact same argument logic.
+/// (which has no full [`Target`]) reuses the exact same argument logic.
 fn settings_cmd(
     workspace: &Path,
     scheme: &str,
@@ -81,7 +94,7 @@ fn settings_cmd(
     cmd
 }
 
-fn base_cmd(cfg: &LaunchConfig) -> Command {
+fn base_cmd(cfg: &Target) -> Command {
     settings_cmd(
         &cfg.workspace,
         &cfg.scheme,
@@ -108,7 +121,7 @@ pub fn build_log_path() -> anyhow::Result<PathBuf> {
 /// the filter/throttle into `sink`. The full log always goes to
 /// `~/.zedxcode/logs/build-latest.log`.
 pub async fn build(
-    cfg: &LaunchConfig,
+    cfg: &Target,
     udid: &str,
     sink: &dyn OutputSink,
     cancel: CancellationToken,
@@ -255,7 +268,7 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
 /// `xcodebuild ... clean` (= Xcode "Clean Build Folder"); stdio inherited.
 /// CLI only: DAP and BSP mode must never call it, because their stdout is
 /// the protocol stream.
-pub async fn clean(cfg: &LaunchConfig) -> anyhow::Result<()> {
+pub async fn clean(cfg: &Target) -> anyhow::Result<()> {
     let status = base_cmd(cfg)
         .arg("clean")
         .kill_on_drop(true)
@@ -360,7 +373,7 @@ fn cache_path() -> anyhow::Result<PathBuf> {
 /// configuration, derivedData)`. Two configs that would resolve different
 /// `.app` products (e.g. a different `-derivedDataPath`) must never share a
 /// cache entry.
-fn settings_cache_key(ws: &Path, cfg: &LaunchConfig, udid: &str) -> String {
+fn settings_cache_key(ws: &Path, cfg: &Target, udid: &str) -> String {
     format!(
         "{}|{}|{}|{}|{}",
         ws.display(),
@@ -396,7 +409,7 @@ fn workspace_mtime(workspace: &Path) -> anyhow::Result<u64> {
 /// not bump the workspace mtime, and the old cached `.app` path may still
 /// exist from a prior build — delete
 /// `~/.zedxcode/cache/build-settings.json` to force re-resolution.
-pub async fn app_path(cfg: &LaunchConfig, udid: &str) -> anyhow::Result<PathBuf> {
+pub async fn app_path(cfg: &Target, udid: &str) -> anyhow::Result<PathBuf> {
     let ws = std::path::absolute(&cfg.workspace).unwrap_or_else(|_| cfg.workspace.clone());
     let mtime = workspace_mtime(&ws)?;
     let key = settings_cache_key(&ws, cfg, udid);
@@ -855,19 +868,12 @@ mod tests {
 
     #[test]
     fn base_cmd_picks_container_flag_by_extension() {
-        let cfg = |workspace: &str| LaunchConfig {
+        let cfg = |workspace: &str| Target {
             workspace: PathBuf::from(workspace),
             scheme: "MyApp".into(),
-            device: None,
-            os: None,
             configuration: None,
-            preflight: None,
-            oslog: false,
-            oslog_predicate: None,
-            terminate_on_stop: true,
-            build_output: BuildOutput::Filtered,
-            verbose_logging: false,
             derived_data: None,
+            build_output: BuildOutput::Filtered,
         };
         let args = |workspace: &str| -> Vec<String> {
             base_cmd(&cfg(workspace))
@@ -968,26 +974,19 @@ mod tests {
         );
     }
 
-    fn cfg_with_derived_data(derived_data: Option<&str>) -> LaunchConfig {
-        LaunchConfig {
+    fn cfg_with_derived_data(derived_data: Option<&str>) -> Target {
+        Target {
             workspace: PathBuf::from("MyApp.xcworkspace"),
             scheme: "MyApp".into(),
-            device: None,
-            os: None,
             configuration: None,
-            preflight: None,
-            oslog: false,
-            oslog_predicate: None,
-            terminate_on_stop: true,
-            build_output: BuildOutput::Filtered,
-            verbose_logging: false,
             derived_data: derived_data.map(PathBuf::from),
+            build_output: BuildOutput::Filtered,
         }
     }
 
     #[test]
     fn base_cmd_appends_derived_data_path_when_set() {
-        let args = |cfg: &LaunchConfig| -> Vec<String> {
+        let args = |cfg: &Target| -> Vec<String> {
             base_cmd(cfg)
                 .as_std()
                 .get_args()

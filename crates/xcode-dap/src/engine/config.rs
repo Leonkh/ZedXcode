@@ -3,6 +3,21 @@
 
 pub use xcode_dap_config::{BuildOutput, LaunchConfig};
 
+/// Why a scenario `config` does not deserialize into [`LaunchConfig`]: the
+/// key at fault and its error when one key alone fails (the extension names
+/// the key the same way), else the whole error.
+pub fn invalid_config_reason(config: &serde_json::Value, err: &serde_json::Error) -> String {
+    let invalid = config.as_object().and_then(|object| {
+        xcode_dap_config::invalid_key::<_, _, serde_json::Error>(
+            object.iter().map(|(key, value)| (key.as_str(), value)),
+        )
+    });
+    match invalid {
+        Some((key, key_err)) => format!("the key \"{key}\" is invalid: {key_err}"),
+        None => err.to_string(),
+    }
+}
+
 /// `extension/debug_adapter_schemas/Xcode.json` must stay in parity with
 /// `LaunchConfig` (one config surface, two artifacts): the same keys, and for
 /// each key the same type, the same default and the same required-ness. Every
@@ -163,8 +178,8 @@ mod tests {
 
         // All Options populated so every field serializes to a key.
         let cfg = LaunchConfig {
-            workspace: "MyApp.xcworkspace".into(),
-            scheme: "MyApp".into(),
+            workspace: Some("MyApp.xcworkspace".into()),
+            scheme: Some("MyApp".into()),
             device: Some("iPhone 15 Pro Max".into()),
             os: Some("26.3".into()),
             configuration: Some("Debug".into()),
@@ -278,6 +293,85 @@ mod tests {
                 "{key}: schema default vs LaunchConfig's value when the key is absent"
             );
         }
+    }
+
+    /// The key the extension and the adapter name for a config that does not
+    /// parse: each key is tried on its own.
+    #[test]
+    fn invalid_key_names_the_key_at_fault() {
+        let reason = |config: Value| {
+            let err = serde_json::from_value::<LaunchConfig>(config.clone()).unwrap_err();
+            invalid_config_reason(&config, &err)
+        };
+        assert_eq!(
+            reason(json!({"scheme": "MyApp", "oslog": "yes", "label": 1})),
+            "the key \"oslog\" is invalid: invalid type: string \"yes\", expected a boolean"
+        );
+        assert_eq!(
+            reason(json!({"workspace": 42})),
+            "the key \"workspace\" is invalid: invalid type: integer `42`, expected path string"
+        );
+        assert_eq!(
+            reason(json!({"buildOutput": "verbose"})),
+            "the key \"buildOutput\" is invalid: unknown variant `verbose`, expected `filtered` \
+             or `full`"
+        );
+        // Unknown keys never fail; a config that is no object has no key.
+        assert_eq!(
+            xcode_dap_config::invalid_key::<_, _, serde_json::Error>(
+                json!({"stopOnEntry": true, "label": "Run"})
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v))
+            )
+            .map(|(k, _)| k),
+            None
+        );
+        assert_eq!(
+            reason(json!("Run")),
+            "invalid type: string \"Run\", expected struct LaunchConfig"
+        );
+    }
+
+    /// The extension's message, built the way `extension/src/lib.rs` builds
+    /// it (that crate is wasm-only and has no host tests).
+    #[test]
+    fn the_extension_names_the_invalid_key_in_the_plan_wording() {
+        let message = |config: &str| {
+            let err = serde_json::from_str::<LaunchConfig>(config).unwrap_err();
+            let parsed = serde_json::from_str::<Value>(config).ok();
+            let invalid = parsed
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|object| {
+                    xcode_dap_config::invalid_key::<_, _, serde_json::Error>(
+                        object.iter().map(|(key, value)| (key.as_str(), value)),
+                    )
+                });
+            xcode_dap_config::invalid_scenario_message("/Users/x/bin/xcode-dap", invalid, &err)
+        };
+        assert_eq!(
+            message(r#"{"scheme": "MyApp", "terminateOnStop": "no"}"#),
+            "Xcode Tools installed xcode-dap at /Users/x/bin/xcode-dap, but the key \
+             \"terminateOnStop\" in this scenario is invalid: invalid type: string \"no\", \
+             expected a boolean. Fix it in .zed/debug.json (hover shows its docs). Scheme, \
+             Destination and Configuration are not set here: use the Xcode: Choose Scheme / \
+             Choose Destination / Choose Configuration tasks (⇧⌘R) or Xcode: Set Up Project."
+        );
+        // No single key at fault (not an object): the whole error.
+        let whole = message(r#""Run""#);
+        assert!(
+            whole.starts_with(
+                "Xcode Tools installed xcode-dap at /Users/x/bin/xcode-dap, but this scenario \
+                 is invalid: invalid type: string \"Run\", expected struct LaunchConfig"
+            ),
+            "{whole}"
+        );
+        assert!(
+            whole.ends_with("(⇧⌘R) or Xcode: Set Up Project."),
+            "{whole}"
+        );
     }
 
     /// The schema's `buildOutput` enum lists exactly the `BuildOutput`

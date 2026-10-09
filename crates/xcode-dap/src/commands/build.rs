@@ -3,10 +3,12 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 
-use crate::engine::config::{BuildOutput, LaunchConfig};
 use crate::engine::pipeline::{self, OutputSink};
+use crate::engine::project;
+use crate::engine::selection::{CliFlags, Request};
 use crate::engine::xcodebuild::BuildFailed;
 
 /// Shared build/run argument set
@@ -45,26 +47,38 @@ pub struct BuildArgs {
 }
 
 impl BuildArgs {
-    pub(crate) fn to_config(&self) -> LaunchConfig {
-        LaunchConfig {
-            workspace: self.workspace.clone(),
-            scheme: self.scheme.clone(),
-            device: self.device.clone(),
-            os: self.os.clone(),
-            configuration: self.configuration.clone(),
-            preflight: None,
-            oslog: self.oslog,
-            oslog_predicate: self.oslog_predicate.clone(),
-            terminate_on_stop: true,
-            build_output: if self.full_output {
-                BuildOutput::Full
-            } else {
-                BuildOutput::Filtered
+    /// The request for this invocation, at the project root found from the
+    /// current directory. The project's selection store outranks these
+    /// flags, as 0.1's overlay did.
+    pub(crate) fn to_request(&self) -> anyhow::Result<Request> {
+        Ok(Request::for_cli(
+            cli_root()?,
+            CliFlags {
+                workspace: Some(absolute(&self.workspace)),
+                scheme: Some(self.scheme.clone()),
+                device: self.device.clone(),
+                os: self.os.clone(),
+                configuration: self.configuration.clone(),
+                derived_data: self.derived_data.clone(),
+                full_output: self.full_output,
+                oslog: self.oslog,
+                oslog_predicate: self.oslog_predicate.clone(),
             },
-            verbose_logging: false,
-            derived_data: self.derived_data.clone(),
-        }
+        ))
     }
+}
+
+/// The project root for a command run from a terminal or a task.
+pub(crate) fn cli_root() -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir().context("reading the current directory")?;
+    let zed_worktree_root = std::env::var_os("ZED_WORKTREE_ROOT").map(PathBuf::from);
+    Ok(project::root_for_cli(&cwd, zed_worktree_root.as_deref()))
+}
+
+/// `path` made absolute against the current directory (flags are relative
+/// to it, not to the project root).
+pub(crate) fn absolute(path: &std::path::Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// CLI `OutputSink`: app stdout to stdout, everything else to stderr.
@@ -100,10 +114,10 @@ pub(crate) fn cancel_on_ctrl_c(token: CancellationToken) {
 }
 
 pub async fn run(args: BuildArgs) -> anyhow::Result<()> {
-    let cfg = args.to_config();
+    let req = args.to_request()?;
     let cancel = CancellationToken::new();
     cancel_on_ctrl_c(cancel.clone());
-    match pipeline::run_build(&cfg, &CliSink, cancel).await {
+    match pipeline::run_build(&req, &CliSink, cancel).await {
         Ok((_udid, app)) => {
             eprintln!("Build succeeded: {}", app.display());
             Ok(())
