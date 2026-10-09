@@ -27,6 +27,18 @@ pub use crate::util::paths::zedxcode_home;
 /// device needs a manual `simctl shutdown` instead of an endless wait.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(240);
 
+/// A debug launch cancelled mid-way first gets this long to finish: killing
+/// the `simctl launch` client does not withdraw a launch the simulator has
+/// already accepted, so a terminate sent at once could run before the app
+/// exists and leave it suspended under `--wait-for-debugger`.
+const CANCELLED_LAUNCH_SETTLE: Duration = Duration::from_secs(1);
+
+/// Then this long to terminate the app it may have started (pid possibly
+/// not yet handed back). Both bounded so a wedged simctl cannot delay the
+/// Stop: together they stay under the DAP proxy's wait for a cancelled
+/// pipeline (4 s).
+const CANCELLED_LAUNCH_TERMINATE_GRACE: Duration = Duration::from_secs(2);
+
 /// Where pipeline output lines go: dap mode -> DAP `output` events;
 /// CLI mode -> plain stderr/stdout.
 pub trait OutputSink: Send + Sync {
@@ -77,7 +89,14 @@ async fn build_phases(
     preflight(cfg, sink, &cancel).await?;
 
     // Phase 2: resolve simulator (+ visible pre-boot for run/debug).
-    let udid = simctl::resolve_device(cfg.device.as_deref(), cfg.os.as_deref()).await?;
+    // `simctl list` hangs while CoreSimulatorService restarts; a Stop must
+    // not wait for it.
+    let udid = unless_cancelled(
+        &cancel,
+        "resolving the simulator",
+        simctl::resolve_device(cfg.device.as_deref(), cfg.os.as_deref()),
+    )
+    .await?;
     sink.line("console", &format!("Simulator: {udid}"));
     if boot {
         sink.line("console", "Booting simulator (visible)...");
@@ -113,8 +132,14 @@ async fn build_phases(
     sink.line("console", &format!("Building scheme \"{}\"...", cfg.scheme));
     xcodebuild::build(cfg, &udid, sink, cancel.clone()).await?;
 
-    // Phase 4: locate the .app product.
-    let app = xcodebuild::app_path(cfg, &udid).await?;
+    // Phase 4: locate the .app product (a cache miss runs
+    // `xcodebuild -showBuildSettings`, which a Stop must not wait out).
+    let app = unless_cancelled(
+        &cancel,
+        "locating the app",
+        xcodebuild::app_path(cfg, &udid),
+    )
+    .await?;
     sink.line("console", &format!("App: {}", app.display()));
 
     // Feed the compile-args store from the just-captured build log so
@@ -179,7 +204,9 @@ fn ingest_build_log(cfg: &LaunchConfig, app: &Path) {
 /// tailers via `consoles::start_tailers` on the returned file paths).
 /// `debug: true` launches with `--wait-for-debugger` (DAP mode);
 /// `false` is the plain `xcode-dap run`. Cancellation is honored
-/// mid-preflight and mid-build (kills the respective process group).
+/// mid-preflight and mid-build (kills the respective process group), and
+/// while locating the app, installing and launching (the helper is dropped,
+/// which kills it; a cancelled debug launch also terminates the app).
 pub async fn run_pipeline(
     cfg: &LaunchConfig,
     debug: bool,
@@ -206,13 +233,15 @@ pub async fn run_pipeline(
     }
 
     // Phase 5: bundle id + install.
-    let bundle_id = bundle_id(&app_path).await?;
+    let bundle_id =
+        unless_cancelled(&cancel, "reading the bundle id", bundle_id(&app_path)).await?;
     log::info!(target: "pipeline", "bundle id: {bundle_id}");
-    if cancel.is_cancelled() {
-        bail!("cancelled");
-    }
     sink.line("console", &format!("Installing {bundle_id}..."));
-    simctl::install(&udid, &app_path).await?;
+    unless_cancelled(&cancel, "installing", simctl::install(&udid, &app_path)).await?;
+    // A Stop that lands as the install finishes must not go on to launch.
+    if cancel.is_cancelled() {
+        bail!("cancelled after installing {bundle_id}");
+    }
 
     // Phase 6-7: launch (+ PID). Console capture files live under
     // ~/.zedxcode/run/<udid>/, absolute and pre-truncated.
@@ -243,7 +272,9 @@ pub async fn run_pipeline(
     // "env" is read yet; the launch still adds NSUnbufferedIO=YES, so print()
     // lines reach the console as they are written.
     let launch_env = BTreeMap::new();
-    let pid = simctl::launch(
+    // Boxed so a cancelled launch can be dropped (killing simctl) after its
+    // bounded settle, before the terminate.
+    let mut launch = Box::pin(simctl::launch(
         &udid,
         &bundle_id,
         app_name,
@@ -251,8 +282,31 @@ pub async fn run_pipeline(
         &launch_env,
         &stdout_file,
         &stderr_file,
-    )
-    .await?;
+    ));
+    let launched = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        r = &mut launch => Some(r),
+    };
+    let Some(launched) = launched else {
+        // simctl may already have started the app, suspended under
+        // `--wait-for-debugger`, without handing back its pid: let a launch
+        // under way finish (bounded), then terminate the app by bundle id so
+        // it is not left frozen. (The plain `run` launches no suspended app,
+        // and its Ctrl-C leaves the app running.)
+        if debug {
+            let _ = tokio::time::timeout(CANCELLED_LAUNCH_SETTLE, &mut launch).await;
+            drop(launch);
+            let _ = tokio::time::timeout(
+                CANCELLED_LAUNCH_TERMINATE_GRACE,
+                simctl::terminate(&udid, &bundle_id),
+            )
+            .await;
+        }
+        bail!("cancelled while launching {bundle_id}");
+    };
+    drop(launch);
+    let pid = launched?;
     sink.line("console", &format!("Launched {bundle_id} (pid {pid})"));
 
     Ok(LaunchedApp {
@@ -263,6 +317,22 @@ pub async fn run_pipeline(
         stdout_file,
         stderr_file,
     })
+}
+
+/// Run one pipeline step unless `cancel` fires first (a fired token wins
+/// even when the step could finish at once). Dropping the step's future kills
+/// its child process (every helper runs with `kill_on_drop`), so a Stop never
+/// waits for a slow simctl or xcodebuild call to return.
+async fn unless_cancelled<T>(
+    cancel: &CancellationToken,
+    what: &str,
+    step: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!("cancelled while {what}"),
+        r = step => r,
+    }
 }
 
 /// Phase 1: if the workspace is missing and a preflight command is
@@ -541,4 +611,49 @@ async fn fail_preflight(
     sink.line("console", "Preflight output unreadable — stopping");
     terminate_group(child, pgid).await;
     anyhow::Error::new(err).context("reading preflight output")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unless_cancelled_returns_when_the_token_fires_mid_step() {
+        // A step that never finishes on its own (a hung `simctl list`).
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+        let started = std::time::Instant::now();
+        let step = std::future::pending::<anyhow::Result<()>>();
+        let err = unless_cancelled(&cancel, "resolving the simulator", step)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "cancelled while resolving the simulator");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn unless_cancelled_prefers_a_fired_token_over_a_finished_step() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let step = async { Ok::<_, anyhow::Error>(7) };
+        assert!(unless_cancelled(&cancel, "installing", step).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unless_cancelled_passes_the_step_result_through() {
+        let cancel = CancellationToken::new();
+        let ok = unless_cancelled(&cancel, "installing", async { Ok::<_, anyhow::Error>(7) });
+        assert_eq!(ok.await.unwrap(), 7);
+        let failed = unless_cancelled(&cancel, "installing", async {
+            Err::<(), _>(anyhow::anyhow!("simctl install failed"))
+        });
+        assert_eq!(
+            failed.await.unwrap_err().to_string(),
+            "simctl install failed"
+        );
+    }
 }

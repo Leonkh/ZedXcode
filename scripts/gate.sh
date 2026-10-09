@@ -53,10 +53,11 @@ step "debug build (scratch target dir)"
 CARGO_TARGET_DIR="$work/target" cargo build --locked # the binary the smoke tests run
 bin="$work/target/debug/xcode-dap"
 
-step "DAP smoke: roundtrip, mock session"
+step "DAP smoke: roundtrip, mock session, Stop killed after its answer"
 if xcrun --find lldb-dap >/dev/null 2>&1; then
   python3 tests/dap_smoke.py --binary "$bin" roundtrip
   python3 tests/dap_smoke.py --binary "$bin" session --mock-pipeline
+  python3 tests/dap_smoke.py --binary "$bin" session --mock-pipeline --kill-after-response
 elif [[ "$(uname -s)" != Darwin ]]; then
   echo "skipped: needs lldb-dap through xcrun (macOS; elsewhere an xcrun shim on PATH)"
 else

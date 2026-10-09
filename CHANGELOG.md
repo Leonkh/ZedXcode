@@ -55,6 +55,18 @@ Tested with: recorded when this becomes a release.
   it still terminates the app.
 - A session replaced by a rerun now says so in the Debug Console and ends
   cleanly instead of disappearing without a word.
+- Stop finishes its cleanup before it answers Zed, which ends the adapter as
+  soon as Stop is answered: the app is terminated (per `terminateOnStop`), the
+  OSLog stream and lldb-dap are stopped and the simulator's pidfile is
+  released first. The cleanup takes at most 2 seconds. Zed's `terminate`
+  request is handled the same way as `disconnect`.
+- Stop while the simulator is being looked up, or during the install or
+  launch step, takes effect at once instead of after the step, and a launch
+  stopped half-way no longer leaves the app suspended. A Stop during the
+  build is answered within 6 seconds even when a step hangs.
+- When the debugger does not attach within 30 seconds, the app, suspended
+  while it waited for the debugger, is terminated and the run fails with a
+  message.
 
 ## [0.1.0] - 2026-07-23
 

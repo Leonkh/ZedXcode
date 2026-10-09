@@ -14,6 +14,13 @@ Subcommands:
               app stdout output events -> disconnect -> clean exit, and no
               process the adapter started (lldb-dap, xcodebuild, the app...)
               still running. (gate 3)
+              With --mock-pipeline --kill-after-response it ends the way Zed
+              does: SIGKILL the adapter right after the disconnect response.
+              Teardown must be done by then: no lldb-dap, mock app or
+              `log stream` (a stand-in that ignores SIGTERM) left, the
+              pidfile gone, and "teardown: done" in the log before the
+              response arrived. HOME points at a temp dir for the run, so the
+              log is the run's own.
   purity      stdout purity: a real (non-mock) launch against a temp project
               with PATH-shimmed fakes of xcrun/simctl, lldb-dap, xcodebuild,
               open, git and plutil that print a canary on stdout; every byte
@@ -23,6 +30,7 @@ Subcommands:
 Usage (note: --binary belongs to the top-level parser, before the subcommand):
   python3 tests/dap_smoke.py [--binary target/debug/xcode-dap] roundtrip
   python3 tests/dap_smoke.py [--binary PATH] session --mock-pipeline
+  python3 tests/dap_smoke.py [--binary PATH] session --mock-pipeline --kill-after-response
   python3 tests/dap_smoke.py [--binary PATH] session --workspace W --scheme S
           [--device D] [--os V] [--configuration C] [--preflight CMD]
           --bp-file FILE --bp-line N [--timeout SECS]
@@ -34,7 +42,9 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -403,6 +413,155 @@ class Recorder:
         )
 
 
+# --- session --kill-after-response ------------------------------------------
+#
+# Zed waits for the answer to its disconnect with no timeout and kills the
+# adapter as soon as it arrives, so whatever the adapter has not cleaned up by
+# then is orphaned: lldb-dap, the app, and the OSLog `log stream`, which runs in
+# its own process group. This mode ends the session the same way and checks
+# that the adapter finished its teardown before it answered.
+
+# xcrun wrapper on PATH for this mode. The mock pipeline's OSLog pump runs
+# `xcrun simctl spawn mock log stream ...`; the stand-in prints one line and
+# then ignores SIGTERM, so the adapter's bounded stop has to SIGKILL the group.
+# Everything else (lldb-dap) goes to the real xcrun.
+KILL_MODE_XCRUN = """#!/bin/sh
+# xcrun wrapper for `dap_smoke.py session --kill-after-response`, generated
+# into a temp dir.
+if [ "$1" = "simctl" ] && [ "$2" = "spawn" ]; then
+  echo "mock oslog line"
+  trap '' TERM
+  exec sleep 300
+fi
+exec @XCRUN@ "$@"
+"""
+
+# Longest the adapter may hold the disconnect answer: lldb-dap's answer (the
+# adapter gives it 3 s) plus the 2 s critical teardown, plus slack for a
+# loaded machine.
+KILL_MODE_HOLD_LIMIT = 6.0
+
+
+def kill_mode_env(root: str):
+    """(env, home) for a kill-after-response run: HOME in `root`, the xcrun
+    wrapper first on PATH. None when no real xcrun is on PATH."""
+    xcrun = shutil.which("xcrun")
+    if not xcrun:
+        return None
+    home = os.path.join(root, "home")
+    bindir = os.path.join(root, "bin")
+    os.makedirs(home)
+    os.makedirs(bindir)
+    wrapper = os.path.join(bindir, "xcrun")
+    with open(wrapper, "w") as f:
+        f.write(KILL_MODE_XCRUN.replace("@XCRUN@", shlex.quote(os.path.abspath(xcrun))))
+    os.chmod(wrapper, 0o755)
+    env = dict(os.environ)
+    env.update(HOME=home, PATH=bindir + os.pathsep + env.get("PATH", ""))
+    # The checks read INFO lines ("teardown: done"); a quieter level set in
+    # the caller's environment would fail them although teardown worked.
+    if env.get("XCODE_DAP_LOG", "").lower() not in ("info", "debug", "trace"):
+        env.pop("XCODE_DAP_LOG", None)
+    return env, home
+
+
+def adapter_log_lines(home: str, pid: int) -> list:
+    """This adapter's lines of xcode-dap.log, in order."""
+    path = os.path.join(home, ".zedxcode", "logs", "xcode-dap.log")
+    try:
+        with open(path, errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    tag = f"[pid {pid} dap]"
+    return [line for line in lines if tag in line]
+
+
+def first_index(lines: list, needle: str) -> int:
+    return next((i for i, line in enumerate(lines) if needle in line), -1)
+
+
+def children_of(parent_pid: int) -> dict:
+    """pid -> command of the running direct children of `parent_pid`."""
+    return {
+        pid: os.path.basename(command)
+        for pid, (ppid, state, command) in process_table().items()
+        if ppid == parent_pid and not state.startswith("Z")
+    }
+
+
+def kill_after_response(client, rec, started: dict, home: str, dummy_pid) -> None:
+    """Steps 8-9 of the kill-after-response mode (see the module docstring)."""
+    adapter_pid = client.proc.pid
+
+    def verify(cond: bool, what: str) -> None:
+        if not cond:  # the log lives in a temp HOME that is removed on exit
+            print("--- xcode-dap.log (this adapter) ---", file=sys.stderr)
+            print("\n".join(adapter_log_lines(home, adapter_pid)[-40:]), file=sys.stderr)
+        check(cond, what, client)
+
+    pidfile = os.path.join(home, ".zedxcode", "run", "sim-mock.pid")
+    verify(os.path.exists(pidfile), "the session holds its pidfile")
+    commands = list(started.values())
+    verify(
+        any("lldb" in c for c in commands) and "mock_app" in commands and "sleep" in commands,
+        "the adapter runs lldb-dap, the mock app and the log stream stand-in "
+        f"(tracked: {describe_pids(started)})",
+    )
+    # The adapter's own children (lldb-dap, the mock app, the log stream
+    # stand-in) are the ones it reaps before answering. Their children
+    # (lldb-dap's debugserver / lldb-server) may take a moment longer to go
+    # and are left to the check after the SIGKILL.
+    own = children_of(adapter_pid)
+    verify(
+        "mock_app" in own.values() and "sleep" in own.values(),
+        "the mock app and the log stream stand-in are the adapter's own children "
+        f"(children: {describe_pids(own)})",
+    )
+    asked = time.monotonic()
+    disc_seq = client.send("disconnect", {"terminateDebuggee": True})
+    resp = rec.response(disc_seq, KILL_MODE_HOLD_LIMIT + DEFAULT_TIMEOUT)
+    held = time.monotonic() - asked
+    # The moment the answer is in: what the log holds and what still runs.
+    log_at_answer = adapter_log_lines(home, adapter_pid)
+    running_at_answer = still_running(own)
+    pidfile_at_answer = os.path.exists(pidfile)
+    os.kill(adapter_pid, signal.SIGKILL)
+    client.wait_exit()
+
+    verify(resp.get("command") == "disconnect", "disconnect response received")
+    verify(resp.get("success") is True, "disconnect response success")
+    done = first_index(log_at_answer, "teardown: done")
+    answered = first_index(log_at_answer, f"disconnect (seq {disc_seq}): answered after teardown")
+    verify(
+        done != -1 and answered != -1 and done < answered,
+        "'teardown: done' is in the log before the response arrived "
+        f"(line {done}; answer logged at line {answered})",
+    )
+    verify(
+        first_index(log_at_answer, "oslog pump did not stop in time") != -1,
+        "the log stream stand-in ignored SIGTERM and the bounded stop SIGKILLed it",
+    )
+    verify(
+        held <= KILL_MODE_HOLD_LIMIT,
+        f"the answer was held {held:.2f}s (limit {KILL_MODE_HOLD_LIMIT:.0f}s)",
+    )
+    verify(
+        not running_at_answer,
+        "none of the adapter's own children runs when the answer arrives "
+        f"(children: {describe_pids(own)}; left: {describe_pids(running_at_answer)})",
+    )
+    left = wait_for_exit_of(started, timeout=2.0)
+    verify(
+        not left,
+        f"no lldb-dap, mock app or log stream left after the SIGKILL ({len(started)} "
+        f"tracked: {describe_pids(started)}; left: {describe_pids(left)})",
+    )
+    verify(not pidfile_at_answer, "pidfile released before the answer")
+    if dummy_pid is not None:
+        verify(not pid_alive(dummy_pid), f"dummy app (pid {dummy_pid}) terminated")
+
+
 def cmd_session(args) -> int:
     binary = os.path.abspath(args.binary)
     if not os.path.exists(binary):
@@ -413,12 +572,35 @@ def cmd_session(args) -> int:
         print("session: --workspace and --scheme are required without "
               "--mock-pipeline", file=sys.stderr)
         return 2
+    kill_mode = args.kill_after_response
+    if kill_mode and not mock:
+        print("session: --kill-after-response needs --mock-pipeline", file=sys.stderr)
+        return 2
+    if not kill_mode:
+        return run_session(args, binary, mock, None, None)
+    root = tempfile.mkdtemp(prefix="zedx-kill.")
+    try:
+        prepared = kill_mode_env(root)
+        if prepared is None:
+            print("session: --kill-after-response needs xcrun on PATH", file=sys.stderr)
+            return 2
+        env, home = prepared
+        return run_session(args, binary, mock, env, home)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
+
+def run_session(args, binary: str, mock: bool, env, home) -> int:
+    """The session mode; `home` (with `env`) selects --kill-after-response."""
+    kill_mode = home is not None
+    label = "session"
+    if mock:
+        label += " (mock, kill after response)" if kill_mode else " (mock)"
     timeout = args.timeout or (60.0 if mock else 1800.0)
     argv = [binary] + (["--mock-pipeline"] if mock else [])
-    print(f"session{' (mock)' if mock else ''}: {' '.join(argv)}")
+    print(f"{label}: {' '.join(argv)}")
 
-    client = DapClient(argv)
+    client = DapClient(argv, env=env)
     # Processes the adapter started, collected while it runs (see descendants()).
     started = {}
     rec = Recorder(client)
@@ -431,6 +613,8 @@ def cmd_session(args) -> int:
         # 2. launch (config = flattened scenario config; the mock ignores it)
         if mock:
             config = {"workspace": "/nonexistent.xcworkspace", "scheme": "Mock"}
+            if kill_mode:
+                config["oslog"] = True  # answered by the xcrun wrapper's stand-in
         else:
             config = {"workspace": args.workspace, "scheme": args.scheme}
             for key, value in (
@@ -541,6 +725,9 @@ def cmd_session(args) -> int:
         if mock:
             rec.stdout_output("mock-app stdout", 30.0)
             print("  ok: app stdout output events flowing")
+            if kill_mode:
+                rec.output_containing("mock oslog line", DEFAULT_TIMEOUT)
+                print("  ok: OSLog pump running (stand-in log stream line arrived)")
         else:
             rec.app_console_output(30.0)
             print("  ok: app console output events flowing (stdout/stderr)")
@@ -567,6 +754,10 @@ def cmd_session(args) -> int:
             f"(tracked: {describe_pids(started)})",
             client,
         )
+        if kill_mode:
+            kill_after_response(client, rec, started, home, dummy_pid)
+            print(f"{label}: PASS")
+            return 0
         disc_seq = client.send("disconnect", {"terminateDebuggee": True})
         resp = rec.response(disc_seq, DEFAULT_TIMEOUT)
         check(resp.get("command") == "disconnect", "disconnect response received", client)
@@ -594,7 +785,7 @@ def cmd_session(args) -> int:
         print(client.dump_stderr(), file=sys.stderr)
         return 1
 
-    print(f"session{' (mock)' if mock else ''}: PASS")
+    print(f"{label}: PASS")
     return 0
 
 
@@ -1124,6 +1315,13 @@ def main() -> int:
         action="store_true",
         help="pass the hidden --mock-pipeline flag (no Xcode needed; "
         "breakpoint may be unverified)",
+    )
+    p_session.add_argument(
+        "--kill-after-response",
+        action="store_true",
+        help="with --mock-pipeline: SIGKILL the adapter right after the "
+        "disconnect response, as Zed does, and assert teardown was done by "
+        "then (HOME is redirected to a temp dir for the run)",
     )
     p_session.add_argument("--workspace", help="path to .xcworkspace/.xcodeproj")
     p_session.add_argument("--scheme", help="Xcode scheme")
