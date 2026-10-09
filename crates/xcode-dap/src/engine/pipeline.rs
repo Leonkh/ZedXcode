@@ -1,6 +1,7 @@
 //! preflight -> build -> install -> launch -> pid pipeline, shared by
 //! dap mode and the CLI. See `docs/design/dap-proxy.md` §4.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -238,11 +239,16 @@ pub async fn run_pipeline(
             if debug { " (waiting for debugger)" } else { "" }
         ),
     );
+    // The app's launch environment. Empty: no scheme environment or scenario
+    // "env" is read yet; the launch still adds NSUnbufferedIO=YES, so print()
+    // lines reach the console as they are written.
+    let launch_env = BTreeMap::new();
     let pid = simctl::launch(
         &udid,
         &bundle_id,
         app_name,
         debug,
+        &launch_env,
         &stdout_file,
         &stderr_file,
     )

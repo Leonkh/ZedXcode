@@ -4,10 +4,12 @@
 # The simulator smoke test. `xcode-dap run` builds the fixture's MyApp scheme,
 # boots a simulator, installs com.example.MyApp and launches it. This script
 # waits for the app's first console line ("MyApp launched") in the run's
-# ~/.zedxcode/run/<udid>/out.log, checks that xcode-dap.log records a
-# successful pipeline for that run, then detaches the run and terminates the
-# app. The logs are copied to the log dir (default: ./smoke-logs) whether the
-# test passes or not; the simulator-smoke workflow uploads that directory.
+# ~/.zedxcode/run/<udid>/out.log and for "tick 1" within 3 s of the launch (the
+# app's stdout reaches the file as it is written), checks that xcode-dap.log
+# records a successful pipeline for that run, then detaches the run, terminates
+# the app and checks that the ticks are still in out.log. The logs are copied to
+# the log dir (default: ./smoke-logs) whether the test passes or not; the
+# simulator-smoke workflow uploads that directory.
 #
 #   --binary PATH   the xcode-dap to test (default: target/debug/xcode-dap)
 #   --log-dir DIR   where the logs go (created if needed)
@@ -47,12 +49,10 @@ scheme="MyApp"
 launch_timeout="${SMOKE_LAUNCH_TIMEOUT:-1200}"
 line_timeout="${SMOKE_LINE_TIMEOUT:-60}"
 window_app="${SMOKE_SIMULATOR_WINDOW:-}"
-# 0 while `xcode-dap run` does not pass NSUnbufferedIO=YES to the app: the test
-# then sets it for the app (app_stdout_env) and skips the tick checks, which
-# would prove nothing with the test's own variable in place. Setting it to 1
-# turns both around at once, so the tick checks can never run on the test's
-# variable.
-launch_sets_unbuffered_io=0
+# 1: `xcode-dap run` passes NSUnbufferedIO=YES to the app itself, so the tick
+# checks run, on the launch's own setting (app_stdout_env removes any inherited
+# one). 0 skips them and changes nothing else.
+launch_sets_unbuffered_io=1
 
 usage() {
   echo "usage: scripts/smoke-sim.sh [--binary PATH] [--log-dir DIR] [--local] <fixture-dir>" >&2
@@ -133,7 +133,9 @@ run_pid=""
 udid=""
 run_dir=""
 launched_at="" # $SECONDS when the run reported the launch
+first_line_at="" # $SECONDS when "MyApp launched" was first seen in out.log
 app_terminated=0
+terminate_status="" # the exit status of `xcrun simctl terminate`, once it ran
 
 # --- helpers ------------------------------------------------------------------
 
@@ -205,7 +207,8 @@ terminate_app() {
     target=booted
   fi
   app_terminated=1
-  xcrun simctl terminate "$target" "$bundle_id" >>"$log_dir/terminate.log" 2>&1 || true
+  terminate_status=0
+  xcrun simctl terminate "$target" "$bundle_id" >>"$log_dir/terminate.log" 2>&1 || terminate_status=$?
 }
 
 collect_logs() {
@@ -271,7 +274,13 @@ out_log_has() {
   [[ -n "$run_dir" ]] && grep -qF -- "$1" "$run_dir/out.log"
 }
 
-# --- checks that later releases fill in -----------------------------------------
+# Like out_log_has, for a whole line ("tick 1" must not match "tick 12").
+out_log_has_line() {
+  run_dir="$(find_run_dir)"
+  [[ -n "$run_dir" ]] && grep -qxF -- "$1" "$run_dir/out.log"
+}
+
+# --- checks -------------------------------------------------------------------
 
 # The simulator window xcode-dap opened: Device Hub with Xcode 27, Simulator
 # with Xcode 26, read from the run's "simulator window: opened <path>" line in
@@ -293,29 +302,48 @@ check_simulator_window() {
 }
 
 # The app's stdout reaches out.log unbuffered: "tick 1" within 3 s of the
-# launch ($launched_at). Runs only with launch_sets_unbuffered_io=1.
+# launch. MyApp prints it a second or more after its first line; buffered, it
+# would sit in a 4 KB stdio buffer for minutes. The clock starts when the script
+# first saw the run's "Launched" line ($launched_at, polled once a second) and
+# counts whole seconds ($SECONDS); "tick 1" must be seen at 3 s or less by that
+# clock, so a line that came within 3 s of the launch always passes. A "tick 1"
+# already there when the check starts counts as seen then. Runs only with
+# launch_sets_unbuffered_io=1.
 check_tick_soon_after_launch() {
+  local elapsed late
   [[ $launch_sets_unbuffered_io -eq 1 ]] || return 0
+  late="\"MyApp launched\" was seen $((first_line_at - launched_at)) s after the launch: when that is late too, the app started slowly; see app-out.log in $log_dir"
+  while :; do
+    elapsed=$((SECONDS - launched_at))
+    out_log_has_line "tick 1" && break
+    [[ $elapsed -le 3 ]] || die "no \"tick 1\" in the run's out.log within 3 s of the launch ($late)"
+    sleep 0.2
+  done
+  [[ $elapsed -le 3 ]] ||
+    die "\"tick 1\" was first seen in the run's out.log $elapsed s after the launch, later than 3 s ($late)"
+  echo "ok: \"tick 1\" in out.log, $elapsed s after the launch"
 }
 
 # Output written before the app was terminated stays in out.log ("tick 1" is
 # still there after `simctl terminate`). Runs only with
 # launch_sets_unbuffered_io=1.
 check_ticks_after_terminate() {
+  local ticks
   [[ $launch_sets_unbuffered_io -eq 1 ]] || return 0
+  [[ "$terminate_status" == 0 ]] ||
+    die "xcrun simctl terminate did not succeed (exit status ${terminate_status:-none}; see $log_dir/terminate.log), so out.log cannot show what survives it"
+  out_log_has_line "tick 1" ||
+    die "\"tick 1\" is no longer in the run's out.log after xcrun simctl terminate"
+  ticks="$(grep -c '^tick [0-9][0-9]*$' "$run_dir/out.log" || true)"
+  echo "ok: \"tick 1\" still in out.log after xcrun simctl terminate ($ticks tick lines)"
 }
 
-# simctl passes SIMCTL_CHILD_* variables to the app. While xcode-dap does not
-# ask for unbuffered app output, the app's print() lines sit in a 4 KB stdio
-# buffer and out.log stays empty for minutes, so the test asks for it itself.
-# Once the launch does, an inherited value is removed instead: it would let the
-# tick checks pass without the launch's own.
+# simctl passes the SIMCTL_CHILD_* variables of its own environment to the app,
+# and xcode-dap sets SIMCTL_CHILD_NSUnbufferedIO=YES on its `simctl launch`. A
+# value inherited from the caller is removed: it would let the tick checks pass
+# without the launch's own.
 app_stdout_env() {
-  if [[ $launch_sets_unbuffered_io -eq 1 ]]; then
-    unset SIMCTL_CHILD_NSUnbufferedIO
-  else
-    export SIMCTL_CHILD_NSUnbufferedIO=YES
-  fi
+  unset SIMCTL_CHILD_NSUnbufferedIO
 }
 
 # Exits 0 when `simctl list --json devices` (stdin) holds an available iPhone on
@@ -371,7 +399,8 @@ echo "ok: xcode-dap launched $bundle_id on ${udid:-<simulator not named>}"
 check_simulator_window
 
 wait_for "$line_timeout" "\"MyApp launched\" in the run's out.log" out_log_has "MyApp launched"
-echo "ok: \"MyApp launched\" in $run_dir/out.log, $((SECONDS - launched_at)) s after the launch"
+first_line_at=$SECONDS
+echo "ok: \"MyApp launched\" in $run_dir/out.log, $((first_line_at - launched_at)) s after the launch"
 check_tick_soon_after_launch
 
 # `xcode-dap run` exits on its own only when the app does.

@@ -2,7 +2,7 @@
 //! terminate, pid fallback, and the deadlines on those calls.
 //! See `docs/design/dap-proxy.md` §4 (phases 2, 5-7).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::time::Duration;
@@ -444,26 +444,36 @@ pub async fn install(udid: &str, app: &Path) -> anyhow::Result<()> {
 ///
 /// `app_name` is the `.app` wrapper stem (e.g. `"MyApp"`), used only by the
 /// ps fallback. `stdout_file`/`stderr_file` must be absolute paths; they are
-/// pre-truncated by the pipeline before launch.
+/// pre-truncated by the pipeline before launch. `env` is the app's launch
+/// environment, plus `NSUnbufferedIO=YES` unless it sets that itself
+/// ([`simctl_child_env`]).
 pub async fn launch(
     udid: &str,
     bundle_id: &str,
     app_name: &str,
     wait_for_debugger: bool,
+    env: &BTreeMap<String, String>,
     stdout_file: &Path,
     stderr_file: &Path,
 ) -> anyhow::Result<i64> {
     // Snapshot pre-launch pids for the PID fallback.
     let before = ps_app_pids(udid, app_name).await.unwrap_or_default();
 
-    let mut cmd = Command::new("xcrun");
-    cmd.args(["simctl", "launch", "--terminate-running-process"]);
-    if wait_for_debugger {
-        cmd.arg("--wait-for-debugger");
-    }
-    cmd.arg(format!("--stdout={}", stdout_file.display()));
-    cmd.arg(format!("--stderr={}", stderr_file.display()));
-    cmd.arg(udid).arg(bundle_id);
+    let mut cmd = launch_command(
+        udid,
+        bundle_id,
+        wait_for_debugger,
+        env,
+        stdout_file,
+        stderr_file,
+    );
+    // Keys only: environment values are never logged.
+    let keys: Vec<&str> = cmd
+        .as_std()
+        .get_envs()
+        .filter_map(|(key, _)| key.to_str()?.strip_prefix(SIMCTL_CHILD_PREFIX))
+        .collect();
+    log::info!(target: "simctl", "launch environment: {}", keys.join(", "));
     let out = output_step(&mut cmd, "xcrun simctl launch", Step::Launch, udid).await?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -506,6 +516,56 @@ pub async fn launch(
          (simctl output: {:?})",
         stdout.trim()
     );
+}
+
+/// simctl hands every `SIMCTL_CHILD_<KEY>` variable of its own environment to
+/// the app it launches as `<KEY>`.
+const SIMCTL_CHILD_PREFIX: &str = "SIMCTL_CHILD_";
+
+/// Foundation's switch for an unbuffered stdout. The app writes its stdout to
+/// the `--stdout` file, not to a terminal, so without it every `print()` line
+/// waits in stdio's block buffer and reaches out.log, and the Debug Console,
+/// only once that buffer fills.
+const UNBUFFERED_IO: &str = "NSUnbufferedIO";
+
+/// The variables to set on the `simctl launch` process so that the app starts
+/// with the launch environment `env`: each entry as `SIMCTL_CHILD_<KEY>`, and
+/// `NSUnbufferedIO=YES` unless `env` sets `NSUnbufferedIO` itself (its own
+/// value wins, whatever it is).
+fn simctl_child_env(env: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    let mut vars: Vec<(String, String)> = env
+        .iter()
+        .map(|(key, value)| (format!("{SIMCTL_CHILD_PREFIX}{key}"), value.clone()))
+        .collect();
+    if !env.contains_key(UNBUFFERED_IO) {
+        vars.push((
+            format!("{SIMCTL_CHILD_PREFIX}{UNBUFFERED_IO}"),
+            "YES".to_string(),
+        ));
+    }
+    vars
+}
+
+/// The `simctl launch` command for [`launch`], with the launch environment
+/// `env` applied ([`simctl_child_env`]).
+fn launch_command(
+    udid: &str,
+    bundle_id: &str,
+    wait_for_debugger: bool,
+    env: &BTreeMap<String, String>,
+    stdout_file: &Path,
+    stderr_file: &Path,
+) -> Command {
+    let mut cmd = Command::new("xcrun");
+    cmd.args(["simctl", "launch", "--terminate-running-process"]);
+    if wait_for_debugger {
+        cmd.arg("--wait-for-debugger");
+    }
+    cmd.arg(format!("--stdout={}", stdout_file.display()));
+    cmd.arg(format!("--stderr={}", stderr_file.display()));
+    cmd.arg(udid).arg(bundle_id);
+    cmd.envs(simctl_child_env(env));
+    cmd
 }
 
 /// Parse "<bundle>: <pid>" from `simctl launch` stdout.
@@ -1109,6 +1169,137 @@ mod tests {
             parse_launch_pid("com.example.myapp.widgets: 7\n", "com.example.myapp"),
             None
         );
+    }
+
+    fn child_env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        child_env(pairs).into_iter().collect()
+    }
+
+    #[test]
+    fn child_env_adds_unbuffered_io_to_an_empty_environment() {
+        assert_eq!(
+            simctl_child_env(&BTreeMap::new()),
+            child_env(&[("SIMCTL_CHILD_NSUnbufferedIO", "YES")])
+        );
+    }
+
+    #[test]
+    fn child_env_prefixes_every_entry_and_adds_unbuffered_io() {
+        assert_eq!(
+            simctl_child_env(&env(&[("MYAPP_FLAG", "1"), ("API_HOST", "example.com")])),
+            child_env(&[
+                ("SIMCTL_CHILD_API_HOST", "example.com"),
+                ("SIMCTL_CHILD_MYAPP_FLAG", "1"),
+                ("SIMCTL_CHILD_NSUnbufferedIO", "YES"),
+            ])
+        );
+    }
+
+    #[test]
+    fn child_env_keeps_an_unbuffered_io_the_environment_sets() {
+        // Its own value wins, NO included; no second entry is added.
+        assert_eq!(
+            simctl_child_env(&env(&[("NSUnbufferedIO", "NO"), ("MYAPP_FLAG", "1")])),
+            child_env(&[
+                ("SIMCTL_CHILD_MYAPP_FLAG", "1"),
+                ("SIMCTL_CHILD_NSUnbufferedIO", "NO"),
+            ])
+        );
+        assert_eq!(
+            simctl_child_env(&env(&[("NSUnbufferedIO", "")])),
+            child_env(&[("SIMCTL_CHILD_NSUnbufferedIO", "")])
+        );
+    }
+
+    #[test]
+    fn child_env_matches_the_unbuffered_io_name_exactly() {
+        // Environment names are case-sensitive: another spelling is just
+        // another variable, and the launch still adds its own.
+        assert_eq!(
+            simctl_child_env(&env(&[("NSUNBUFFEREDIO", "NO")])),
+            child_env(&[
+                ("SIMCTL_CHILD_NSUNBUFFEREDIO", "NO"),
+                ("SIMCTL_CHILD_NSUnbufferedIO", "YES"),
+            ])
+        );
+    }
+
+    #[test]
+    fn launch_command_applies_the_launch_environment() {
+        let udid = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
+        let run = format!("/Users/Jane/.zedxcode/run/{udid}");
+        let cmd = launch_command(
+            udid,
+            "com.example.MyApp",
+            true,
+            &env(&[("MYAPP_FLAG", "1")]),
+            &Path::new(&run).join("out.log"),
+            &Path::new(&run).join("err.log"),
+        );
+        let std_cmd = cmd.as_std();
+        assert_eq!(std_cmd.get_program(), "xcrun");
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "simctl".to_string(),
+                "launch".to_string(),
+                "--terminate-running-process".to_string(),
+                "--wait-for-debugger".to_string(),
+                format!("--stdout={run}/out.log"),
+                format!("--stderr={run}/err.log"),
+                udid.to_string(),
+                "com.example.MyApp".to_string(),
+            ]
+        );
+        // The environment rides on the simctl process, never on its arguments.
+        let envs: Vec<(String, Option<String>)> = std_cmd
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs,
+            [
+                ("SIMCTL_CHILD_MYAPP_FLAG".to_string(), Some("1".to_string())),
+                (
+                    "SIMCTL_CHILD_NSUnbufferedIO".to_string(),
+                    Some("YES".to_string())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_command_without_the_debugger_wait() {
+        let cmd = launch_command(
+            "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+            "com.example.MyApp",
+            false,
+            &BTreeMap::new(),
+            Path::new("/Users/x/out.log"),
+            Path::new("/Users/x/err.log"),
+        );
+        let std_cmd = cmd.as_std();
+        assert!(!std_cmd.get_args().any(|arg| arg == "--wait-for-debugger"));
+        let envs: Vec<_> = std_cmd.get_envs().collect();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].0, "SIMCTL_CHILD_NSUnbufferedIO");
+        assert_eq!(envs[0].1, Some(std::ffi::OsStr::new("YES")));
     }
 
     #[test]

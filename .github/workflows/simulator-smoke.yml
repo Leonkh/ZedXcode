@@ -1,10 +1,10 @@
 # Simulator smoke test: scripts/smoke-sim.sh builds MyApp with `xcode-dap run`,
-# boots a simulator, launches the app and checks its console and the
-# pipeline log, once on Xcode 26 (macos-26) and once on Xcode 27.0
-# (the xcode-27 runner). Each leg fails when its Xcode is not the major
-# version it stands for, or is a beta, and when xcode-dap opened another app
-# for the simulator window than that Xcode's (Simulator on 26, Device Hub on
-# 27).
+# boots a simulator, launches the app and checks its console (print() lines
+# arrive as they are written and are still there after the app is terminated)
+# and the pipeline log, once on Xcode 26 (macos-26) and once on Xcode 27.0 (the
+# xcode-27 runner). Each leg fails when its Xcode is not the major version it
+# stands for, or is a beta, and when xcode-dap opened another app for the
+# simulator window than that Xcode's (Simulator on 26, Device Hub on 27).
 #
 # A leg takes minutes and boots a simulator, so the test does not run on every
 # push: it runs on demand, for release tags, and for pull requests that touch
