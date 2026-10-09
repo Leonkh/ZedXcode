@@ -622,6 +622,8 @@ PURITY_SPAWNS = (
     ("xcrun lldb-dap", r"xcrun lldb-dap\b"),
     ("lldb-dap", r"lldb-dap\b"),
     ("simctl list", r"xcrun simctl list\b"),
+    ("xcode-select -p", r"xcode-select -p\b"),
+    ("open <Simulator.app>", r"open /\S*/Simulator\.app$"),
     ("open -a Simulator", r"open -a Simulator\b"),
     ("xcodebuild -showBuildSettings", r"xcodebuild .*-showBuildSettings\b"),
     ("xcodebuild build", r"xcodebuild (?!.*-showBuildSettings).* build$"),
@@ -697,8 +699,19 @@ JSON
 esac
 """
 
+# Always fails, so the launch reaches both spawns of the simulator window (the
+# developer dir's Simulator.app, then the fallback `open -a Simulator`) and must
+# carry on headless: a window that does not open is never fatal.
 FAKE_OPEN = FAKE_HEADER + """echo "@CANARY@ open $*"
+case "$1" in
+  /*.app) echo "fake open: cannot open $1" >&2 ;;
+  *) echo "fake open: Unable to find application named 'Simulator'" >&2 ;;
+esac
+exit 1
 """
+# The console line for a simulator window that did not open, carrying the
+# preferred app's error rather than the fallback's.
+PURITY_WINDOW_LINE = "Could not open the simulator window (fake open: cannot open "
 
 FAKE_GIT = FAKE_HEADER + """case "$1" in
   rev-parse)
@@ -723,8 +736,8 @@ FAKE_GIT = FAKE_HEADER + """case "$1" in
 esac
 """
 
-# Not reached by today's pipeline; answers `-p` for code that looks up the
-# developer dir (DEVELOPER_DIR is removed from the adapter's environment).
+# Answers `-p` for the simulator window's developer dir lookup
+# (DEVELOPER_DIR is removed from the adapter's environment).
 FAKE_XCODE_SELECT = FAKE_HEADER + """if [ "$1" = "-p" ] || [ "$1" = "--print-path" ]; then
   echo "@DEVELOPER_DIR@"  # the caller reads the path, so no canary
 else
@@ -949,11 +962,10 @@ def run_purity(binary: str, root: str, timeout: float) -> int:
     fake_log = os.path.join(root, "fake-invocations.log")
     for d in (home, bindir, os.path.join(project, ".zed")):
         os.makedirs(d)
-    fakes = write_fakes(
-        bindir,
-        os.path.join(root, "DerivedData", "MyApp"),
-        os.path.join(root, "Xcode.app", "Contents", "Developer"),
-    )
+    developer_dir = os.path.join(root, "Xcode.app", "Contents", "Developer")
+    # The Xcode 26 layout, so the simulator window tries the bundle path first.
+    os.makedirs(os.path.join(developer_dir, "Applications", "Simulator.app"))
+    fakes = write_fakes(bindir, os.path.join(root, "DerivedData", "MyApp"), developer_dir)
     open(fake_log, "w").close()
     # An "Xcode" scenario opts the project in to buildServer.json, whose first
     # write git-ignores it (the git probes).
@@ -994,6 +1006,15 @@ def run_purity(binary: str, root: str, timeout: float) -> int:
         resp = rec.response(launch_seq, timeout)
         if resp.get("success") is True:
             print("  ok: launch succeeded against the fakes")
+            # Every `open` failed, so the launch only got here because the
+            # simulator window is never fatal; the reason must reach the console.
+            try:
+                rec.output_containing(PURITY_WINDOW_LINE, DEFAULT_TIMEOUT)
+                print("  ok: the failed simulator window was one console line, not fatal")
+            except TimeoutError:
+                session_failures.append(
+                    f"no output event with {PURITY_WINDOW_LINE!r} although every `open` failed"
+                )
             # One line each from the console tailer and the log stream.
             for needle in ("MyApp stdout line", "MyApp oslog line"):
                 try:

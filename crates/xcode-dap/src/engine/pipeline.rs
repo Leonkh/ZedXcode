@@ -20,8 +20,8 @@ use crate::util::procgroup;
 // can keep importing it from the pipeline module.
 pub use crate::util::paths::zedxcode_home;
 
-/// Generous cap on the whole boot phase (`simctl boot` + retries +
-/// Simulator.app open + `bootstatus` wait): a cold boot finishes in well
+/// Generous cap on the whole boot phase (`simctl boot` + retries + the
+/// simulator window + `bootstatus` wait): a cold boot finishes in well
 /// under a minute, so hitting this means `bootstatus` is wedged and the
 /// device needs a manual `simctl shutdown` instead of an endless wait.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(240);
@@ -81,13 +81,21 @@ async fn build_phases(
     if boot {
         sink.line("console", "Booting simulator (visible)...");
         tokio::select! {
-            r = tokio::time::timeout(BOOT_TIMEOUT, simctl::boot(&udid)) => match r {
+            r = tokio::time::timeout(BOOT_TIMEOUT, simctl::boot(&udid, sink)) => match r {
                 Ok(r) => r?,
-                Err(_) => bail!(
-                    "simulator did not finish booting in {}s — try \
-                     `xcrun simctl shutdown {udid}` and rerun",
-                    BOOT_TIMEOUT.as_secs()
-                ),
+                Err(_) => {
+                    // The first-launch check behind the message spawns
+                    // xcodebuild, so a Stop must still cut it short.
+                    let error = simctl::timed_out(format!(
+                        "the simulator did not finish booting in {} s; it may be wedged: \
+                         run \"xcrun simctl shutdown {udid}\" and press ⌘R again.",
+                        BOOT_TIMEOUT.as_secs()
+                    ));
+                    tokio::select! {
+                        e = error => return Err(e),
+                        _ = cancel.cancelled() => bail!("cancelled while booting simulator"),
+                    }
+                }
             },
             _ = cancel.cancelled() => bail!("cancelled while booting simulator"),
         }
@@ -365,7 +373,8 @@ async fn ensure_build_server(
             Err(e) => {
                 log::warn!(
                     target: "pipeline",
-                    "buildServer.json regen skipped: cannot resolve build_root: {e:#}"
+                    "buildServer.json regen skipped (retried on the next run): cannot resolve \
+                     build_root: {e:#}"
                 );
                 return Ok(());
             }

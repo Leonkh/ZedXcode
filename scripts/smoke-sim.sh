@@ -22,6 +22,11 @@
 # iphonesimulator SDK version) when one is available; SMOKE_OS overrides the
 # version. See pick_os.
 #
+# SMOKE_SIMULATOR_WINDOW names the app the run must open for the simulator
+# window: DeviceHub.app (Xcode 27) or Simulator.app (Xcode 26). The
+# simulator-smoke workflow sets it per leg; unset, either one passes. See
+# check_simulator_window.
+#
 # HOME is not redirected. xcode-dap keeps its state under $HOME/.zedxcode and
 # has no setting that moves only that, while a redirected HOME can also move
 # what xcrun and xcodebuild keep under ~/Library (simulator devices,
@@ -41,6 +46,7 @@ bundle_re='com\.example\.MyApp' # bundle_id as an extended regex
 scheme="MyApp"
 launch_timeout="${SMOKE_LAUNCH_TIMEOUT:-1200}"
 line_timeout="${SMOKE_LINE_TIMEOUT:-60}"
+window_app="${SMOKE_SIMULATOR_WINDOW:-}"
 # 0 while `xcode-dap run` does not pass NSUnbufferedIO=YES to the app: the test
 # then sets it for the app (app_stdout_env) and skips the tick checks, which
 # would prove nothing with the test's own variable in place. Setting it to 1
@@ -95,6 +101,10 @@ fi
 if [[ -z "${CI:-}" && $local_run -eq 0 ]]; then
   die "outside CI this writes into ~/.zedxcode and drives a simulator; pass --local to run it anyway"
 fi
+case "$window_app" in
+  "" | DeviceHub.app | Simulator.app) ;;
+  *) die "SMOKE_SIMULATOR_WINDOW must be DeviceHub.app or Simulator.app (got \"$window_app\")" ;;
+esac
 [[ -x "$bin" ]] || die "no xcode-dap at $bin (run cargo build first, or pass --binary)"
 [[ -d "$fixture/MyApp.xcodeproj" ]] || die "$fixture has no MyApp.xcodeproj"
 bin="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
@@ -264,10 +274,22 @@ out_log_has() {
 # --- checks that later releases fill in -----------------------------------------
 
 # The simulator window xcode-dap opened: Device Hub with Xcode 27, Simulator
-# with Xcode 26, read from xcode-dap.log. Nothing to check yet: the run still
-# opens Simulator.app the same way on every Xcode.
+# with Xcode 26, read from the run's "simulator window: opened <path>" line in
+# xcode-dap.log. The path must be the app SMOKE_SIMULATOR_WINDOW names (either
+# one when unset); the `open -a Simulator` fallback logs no app path, so it
+# fails here too.
 check_simulator_window() {
-  :
+  local line opened
+  line="$(run_log_lines | grep -F 'simulator window: opened ' | tail -n 1 || true)"
+  [[ -n "$line" ]] || die "xcode-dap.log has no \"simulator window: opened\" line for this run"
+  opened="${line#*simulator window: opened }"
+  if [[ -n "$window_app" ]]; then
+    [[ "$opened" == */"$window_app" ]] ||
+      die "the simulator window opened $opened, expected .../$window_app"
+  elif [[ "$opened" != */DeviceHub.app && "$opened" != */Simulator.app ]]; then
+    die "the simulator window opened $opened, expected .../DeviceHub.app or .../Simulator.app"
+  fi
+  echo "ok: xcode-dap.log: simulator window: opened $opened"
 }
 
 # The app's stdout reaches out.log unbuffered: "tick 1" within 3 s of the

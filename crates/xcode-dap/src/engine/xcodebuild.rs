@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::engine::config::{BuildOutput, LaunchConfig};
 use crate::engine::pipeline::OutputSink;
+use crate::setup::project::shell_quote;
 use crate::util::logging;
 use crate::util::paths::{container_flag, zedxcode_home};
 use crate::util::procgroup;
@@ -275,6 +276,69 @@ pub async fn clean(cfg: &LaunchConfig) -> anyhow::Result<()> {
 // App path via -showBuildSettings (mtime-keyed cache)
 // ---------------------------------------------------------------------------
 
+/// Deadline for one `xcodebuild -showBuildSettings`: it answers in seconds,
+/// unless Swift package resolution (which it runs first) is slow or stuck.
+const SETTINGS_DEADLINE: Duration = Duration::from_secs(120);
+
+/// When a `-showBuildSettings` call runs, which decides what its timeout
+/// message blames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsCall {
+    /// Before any build (the build root): package resolution may still be
+    /// fetching.
+    BeforeBuild,
+    /// After a successful build (the app path): the build already resolved
+    /// the packages.
+    AfterBuild,
+}
+
+/// Run a `-showBuildSettings` command under [`SETTINGS_DEADLINE`]; a missed
+/// deadline kills it (`kill_on_drop`) and fails with
+/// [`settings_timeout_message`].
+async fn show_build_settings(
+    cmd: &mut Command,
+    workspace: &Path,
+    scheme: &str,
+    call: SettingsCall,
+    what: &str,
+) -> anyhow::Result<std::process::Output> {
+    let output = cmd.stdin(Stdio::null()).kill_on_drop(true).output();
+    match tokio::time::timeout(SETTINGS_DEADLINE, output).await {
+        Ok(out) => out.with_context(|| format!("running {what}")),
+        Err(_) => {
+            let message = settings_timeout_message(workspace, scheme, call, SETTINGS_DEADLINE);
+            log::warn!(target: "xcodebuild", "{message}");
+            bail!(message)
+        }
+    }
+}
+
+/// What the user reads when `-showBuildSettings` misses its deadline: the
+/// step, then a command to run in a terminal to see where it stops.
+fn settings_timeout_message(
+    workspace: &Path,
+    scheme: &str,
+    call: SettingsCall,
+    deadline: Duration,
+) -> String {
+    let (cause, action) = match call {
+        SettingsCall::BeforeBuild => (
+            "Swift package resolution may be slow or stuck",
+            "-resolvePackageDependencies",
+        ),
+        SettingsCall::AfterBuild => ("xcodebuild may be stuck", "-showBuildSettings"),
+    };
+    format!(
+        "xcodebuild -showBuildSettings did not finish in {} s; {cause}: run \
+         \"xcodebuild {action} {} {} -scheme {}\" in a terminal to see where it stops, \
+         then retry.",
+        deadline.as_secs(),
+        container_flag(workspace),
+        shell_quote(&workspace.to_string_lossy()),
+        shell_quote(scheme)
+    )
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct SettingsCache {
     entries: HashMap<String, CacheEntry>,
@@ -355,15 +419,18 @@ pub async fn app_path(cfg: &LaunchConfig, udid: &str) -> anyhow::Result<PathBuf>
     log::info!(target: "xcodebuild", "app path cache miss — running -showBuildSettings");
 
     let started = std::time::Instant::now();
-    let out = base_cmd(cfg)
-        .arg("-destination")
+    let mut cmd = base_cmd(cfg);
+    cmd.arg("-destination")
         .arg(format!("platform=iOS Simulator,id={udid}"))
-        .args(["-showBuildSettings", "-json", "build"])
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .context("running xcodebuild -showBuildSettings")?;
+        .args(["-showBuildSettings", "-json", "build"]);
+    let out = show_build_settings(
+        &mut cmd,
+        &ws,
+        &cfg.scheme,
+        SettingsCall::AfterBuild,
+        "xcodebuild -showBuildSettings",
+    )
+    .await?;
     log::info!(
         target: "xcodebuild",
         "-showBuildSettings exited {} in {} ms",
@@ -493,18 +560,21 @@ pub async fn resolve_build_root(
     log::info!(target: "xcodebuild", "build_root cache miss — running -showBuildSettings");
 
     let started = std::time::Instant::now();
-    let out = settings_cmd(&ws, scheme, configuration, None)
-        // A generic simulator destination resolves settings without a booted
-        // device; BUILD_DIR (the per-workspace DerivedData root) is
-        // destination-independent anyway.
-        .arg("-destination")
+    let mut cmd = settings_cmd(&ws, scheme, configuration, None);
+    // A generic simulator destination resolves settings without a booted
+    // device; BUILD_DIR (the per-workspace DerivedData root) is
+    // destination-independent anyway.
+    cmd.arg("-destination")
         .arg("generic/platform=iOS Simulator")
-        .args(["-showBuildSettings", "-json", "build"])
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .context("running xcodebuild -showBuildSettings for build_root")?;
+        .args(["-showBuildSettings", "-json", "build"]);
+    let out = show_build_settings(
+        &mut cmd,
+        &ws,
+        scheme,
+        SettingsCall::BeforeBuild,
+        "xcodebuild -showBuildSettings for build_root",
+    )
+    .await?;
     log::info!(
         target: "xcodebuild",
         "-showBuildSettings (build_root) exited {} in {} ms",
@@ -820,6 +890,38 @@ mod tests {
         assert_eq!(
             args("MyApp.xcodeproj/project.xcworkspace")[..2],
             ["-workspace", "MyApp.xcodeproj/project.xcworkspace"]
+        );
+    }
+
+    #[test]
+    fn settings_timeout_message_names_the_step_and_the_fix() {
+        // Before a build, package resolution is the likely holdup.
+        assert_eq!(
+            settings_timeout_message(
+                Path::new("/Users/Jane/Projects/MyApp/MyApp.xcworkspace"),
+                "MyApp",
+                SettingsCall::BeforeBuild,
+                SETTINGS_DEADLINE
+            ),
+            "xcodebuild -showBuildSettings did not finish in 120 s; Swift package resolution \
+             may be slow or stuck: run \"xcodebuild -resolvePackageDependencies -workspace \
+             /Users/Jane/Projects/MyApp/MyApp.xcworkspace -scheme MyApp\" in a terminal to \
+             see where it stops, then retry."
+        );
+        // After a build the packages are resolved, so the message blames no
+        // cause it cannot know and repeats the call itself. A bare project
+        // goes through -project; paths and schemes with spaces stay one shell
+        // word each.
+        assert_eq!(
+            settings_timeout_message(
+                Path::new("/Users/x/My Apps/MyApp.xcodeproj"),
+                "MyApp Dev",
+                SettingsCall::AfterBuild,
+                SETTINGS_DEADLINE
+            ),
+            "xcodebuild -showBuildSettings did not finish in 120 s; xcodebuild may be stuck: \
+             run \"xcodebuild -showBuildSettings -project '/Users/x/My Apps/MyApp.xcodeproj' \
+             -scheme 'MyApp Dev'\" in a terminal to see where it stops, then retry."
         );
     }
 

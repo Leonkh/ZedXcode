@@ -2,7 +2,9 @@
 # boots a simulator, launches the app and checks its console and the
 # pipeline log, once on Xcode 26 (macos-26) and once on Xcode 27.0
 # (the xcode-27 runner). Each leg fails when its Xcode is not the major
-# version it stands for, or is a beta.
+# version it stands for, or is a beta, and when xcode-dap opened another app
+# for the simulator window than that Xcode's (Simulator on 26, Device Hub on
+# 27).
 #
 # A leg takes minutes and boots a simulator, so the test does not run on every
 # push: it runs on demand, for release tags, and for pull requests that touch
@@ -57,14 +59,18 @@ jobs:
       fail-fast: false
       matrix:
         # xcode: the version to select ("" = the image's default);
-        # major: the major version the leg must end up on.
+        # major: the major version the leg must end up on;
+        # window: the app xcode-dap must open to show the simulator (Device
+        # Hub replaced Simulator in Xcode 27).
         include:
           - runner: macos-26
             xcode: ""
             major: "26"
+            window: Simulator.app
           - runner: xcode-27
             xcode: "27.0"
             major: "27"
+            window: DeviceHub.app
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -164,6 +170,8 @@ jobs:
         run: cargo build --locked
 
       - name: Smoke test
+        env:
+          SMOKE_SIMULATOR_WINDOW: ${{ matrix.window }}
         run: scripts/smoke-sim.sh --binary target/debug/xcode-dap --log-dir "$RUNNER_TEMP/smoke-logs" tests/fixtures/myapp
 
       - name: Upload the logs
