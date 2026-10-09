@@ -1,7 +1,8 @@
 //! `xcode-dap doctor` — environment checks: Darwin, Xcode + `xcrun -f
 //! lldb-dap`, simctl, sourcekit-lsp, Zed, buildServer.json
-//! presence/freshness/contents + `argv` (when in a project), stale
-//! pidfiles. Exit code is non-zero when any ✗ check fails.
+//! presence/freshness/contents + `argv` and tasks that reuse the Xcode task
+//! labels (when in a project), stale pidfiles. Exit code is non-zero when
+//! any ✗ check fails.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,7 @@ use anyhow::bail;
 
 use crate::engine::pipeline::zedxcode_home;
 use crate::setup::project::{build_server_opted_in, find_in_path};
+use crate::setup::task_collisions;
 use crate::util::paths::{mtime, workspace_mtime};
 
 #[derive(Default)]
@@ -383,6 +385,7 @@ fn check_project(d: &mut Doctor) {
         return;
     }
     check_tasks_command(d, &cwd);
+    check_task_labels(d, &cwd);
     let build_server = cwd.join("buildServer.json");
     if !build_server.exists() {
         if missing_build_server_is_failure(&cwd, workspace.is_some()) {
@@ -673,6 +676,43 @@ fn check_tasks_command(d: &mut Doctor, dir: &Path) {
                      absolute path) or ./install.sh"
                 ),
             );
+        }
+    }
+}
+
+/// Tasks that reuse the `Xcode: …` labels without running xcode-dap, in the
+/// project's `.zed/tasks.json` and `.vscode/tasks.json` files (its own, the
+/// ones in folders below it and above it in the repository) and the user's
+/// Zed `tasks.json`: a label a key spawns by name (⌘B, ⇧⌘K) is a warning,
+/// any other `Xcode: …` label a note.
+fn check_task_labels(d: &mut Doctor, dir: &Path) {
+    let zed_config_dir = crate::setup::user::zed_config_dir().ok();
+    let findings = task_collisions::scan(Some(dir), zed_config_dir.as_deref());
+    if findings.is_empty() {
+        let checked = if zed_config_dir.is_some() {
+            "the project's .zed and .vscode tasks files and your Zed tasks.json"
+        } else {
+            "the project's .zed and .vscode tasks files"
+        };
+        d.ok(
+            "task labels",
+            &format!("no \"Xcode: …\" task that ZedXcode did not write in {checked}"),
+        );
+        return;
+    }
+    // scan reports project files under the canonical project path.
+    let base = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let own_tasks = base.join(".zed").join("tasks.json");
+    for finding in findings {
+        // check_tasks_command already warned that this file does not parse.
+        if finding.parse_error && finding.path == own_tasks {
+            continue;
+        }
+        let label = finding.path.strip_prefix(&base).unwrap_or(&finding.path);
+        let label = task_collisions::printable(&label.display().to_string());
+        match finding.level {
+            task_collisions::Level::Warn => d.warn(&label, &finding.text),
+            task_collisions::Level::Note => d.note(&label, &finding.text),
         }
     }
 }

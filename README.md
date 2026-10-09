@@ -260,6 +260,13 @@ navigation keeps working against the new project.
 - **Macs whose only Xcode is Xcode 27:** v0.1.0 needs Simulator.app, which
   Xcode 27 replaced with Device Hub, so every ⌘R stops in the boot phase.
   Until the next release, keep an Xcode 26 installed alongside.
+- **A project can define its own "Xcode: Build" or "Xcode: Clean" task** —
+  ⌘B and ⌘⇧K spawn tasks by label, so they also run a task with that label
+  from a `.zed/tasks.json` or `.vscode/tasks.json` anywhere in the project (or
+  your own Zed `tasks.json`), whatever its command; Zed's Restricted Mode does
+  not stop tasks. From the next release, `xcode-dap doctor` and
+  `xcode-dap setup` warn about such tasks that ZedXcode did not write: remove
+  them, or do not press that key in that project.
 - **First ⌘R after a Zed restart opens the New Session modal** — Zed's
   `debugger::Rerun` needs one scenario pick per app session. Pick once, then
   the rerun loop resumes.

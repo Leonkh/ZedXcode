@@ -1,13 +1,15 @@
 //! `xcode-dap setup [--project <dir>] [--user [--remove] [--dry-run]
 //! [--relocate | --replace]] [--yes]` — the user keymap marker block (and
-//! retiring 0.1's settings block) and per-project config. See design §6.1.
+//! retiring 0.1's settings block) and per-project config, then a list of
+//! the tasks that reuse the Xcode task labels. See design §6.1.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::bail;
 
 use crate::setup::jsonc::OnEdited;
+use crate::setup::task_collisions::{self, Level};
 use crate::setup::{project, user};
 
 #[derive(clap::Args, Debug)]
@@ -126,6 +128,14 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
         }
     }
 
+    // The scan only reads, so a dry run and a declined prompt get it too;
+    // after --remove no ZedXcode key spawns the labels any more.
+    let scan_project = args
+        .project
+        .as_deref()
+        .map(|dir| dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()));
+    let scan_tasks = !args.remove;
+
     if let Some(dir) = args.project {
         if confirm(
             &format!("Write .zed config into {}?", dir.display()),
@@ -143,7 +153,33 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
             project::setup_project(&dir, flags).await?;
         }
     }
+
+    if scan_tasks {
+        let zed_config_dir = user::zed_config_dir().ok();
+        print_task_collisions(scan_project.as_deref(), zed_config_dir.as_deref());
+    }
     Ok(())
+}
+
+/// Every task that reuses an `Xcode: …` label without running xcode-dap:
+/// in the project's `.zed/tasks.json` and `.vscode/tasks.json` files (with
+/// `--project`) and the user's Zed `tasks.json`. A label a key spawns by
+/// name (⌘B, ⇧⌘K) is a warning, any other `Xcode: …` label a note; nothing
+/// is printed when there are none.
+fn print_task_collisions(project: Option<&Path>, zed_config_dir: Option<&Path>) {
+    let findings = task_collisions::scan(project, zed_config_dir);
+    if findings.is_empty() {
+        return;
+    }
+    println!();
+    for finding in findings {
+        let mark = match finding.level {
+            Level::Warn => '!',
+            Level::Note => '–',
+        };
+        let path = task_collisions::printable(&finding.path.display().to_string());
+        println!("{mark} {path}: {}", finding.text);
+    }
 }
 
 fn confirm(prompt: &str, yes: bool) -> anyhow::Result<bool> {
