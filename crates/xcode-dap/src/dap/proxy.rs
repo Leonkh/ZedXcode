@@ -996,7 +996,11 @@ async fn mock_pipeline(
         .await
         .context("writing mock_app.c")?;
     let mut cc = Command::new("cc");
-    cc.arg("-o").arg(&exe).arg(&src).kill_on_drop(true);
+    cc.arg("-o")
+        .arg(&exe)
+        .arg(&src)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
     let out = tokio::select! {
         out = cc.output() => out.context("running cc")?,
         _ = cancel.cancelled() => bail!("cancelled"),

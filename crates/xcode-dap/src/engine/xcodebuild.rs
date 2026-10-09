@@ -252,6 +252,8 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
 }
 
 /// `xcodebuild ... clean` (= Xcode "Clean Build Folder"); stdio inherited.
+/// CLI only: DAP and BSP mode must never call it, because their stdout is
+/// the protocol stream.
 pub async fn clean(cfg: &LaunchConfig) -> anyhow::Result<()> {
     let status = base_cmd(cfg)
         .arg("clean")

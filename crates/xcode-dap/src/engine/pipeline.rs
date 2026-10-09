@@ -417,6 +417,7 @@ async fn bundle_id(app: &std::path::Path) -> anyhow::Result<String> {
     let out = Command::new("plutil")
         .args(["-extract", "CFBundleIdentifier", "raw"])
         .arg(&plist)
+        .stdin(Stdio::null())
         .kill_on_drop(true)
         .output()
         .await

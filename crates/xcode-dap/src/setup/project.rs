@@ -582,6 +582,7 @@ pub fn ensure_git_exclude(dir: &Path) -> Result<()> {
 /// file so the write does not dirty `git status`. Prints nothing (the
 /// pipeline's stdout is the DAP wire); failures are logged and swallowed.
 /// Returns whether a line was appended.
+#[deny(clippy::print_stdout)] // runs in DAP mode
 pub(crate) fn git_exclude_build_server(dir: &Path) -> bool {
     let run_git = |args: &[&str]| {
         std::process::Command::new("git")
@@ -647,12 +648,14 @@ pub(crate) fn git_exclude_build_server(dir: &Path) -> bool {
 /// Session modal, or hand-edited — all mean the project uses this adapter).
 /// A repo with neither — including one whose debug.json only configures
 /// other adapters — never opted in.
+#[deny(clippy::print_stdout)] // runs in DAP mode
 pub(crate) fn build_server_opted_in(dir: &Path, build_server: &Path) -> bool {
     build_server.exists() || debug_json_has_xcode_scenario(dir)
 }
 
 /// Does `.zed/debug.json` under `dir` contain an `"Xcode"` adapter
 /// scenario? Best-effort: an unreadable or unparseable file counts as no.
+#[deny(clippy::print_stdout)] // runs in DAP mode
 fn debug_json_has_xcode_scenario(dir: &Path) -> bool {
     let Ok(text) = fs::read_to_string(dir.join(".zed").join("debug.json")) else {
         return false;

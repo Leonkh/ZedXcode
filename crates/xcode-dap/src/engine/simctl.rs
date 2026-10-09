@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
@@ -343,6 +344,7 @@ fn parse_launch_pid(stdout: &str, bundle_id: &str) -> Option<i64> {
 async fn ps_app_pids(udid: &str, app_name: &str) -> anyhow::Result<HashSet<i64>> {
     let out = Command::new("ps")
         .args(["axww", "-o", "pid=,comm="])
+        .stdin(Stdio::null())
         .kill_on_drop(true)
         .output()
         .await
@@ -387,11 +389,14 @@ async fn run_ok(cmd: &mut Command, what: &str) -> anyhow::Result<()> {
 }
 
 /// Run `cmd` to completion, logging the full command, exit status and
-/// duration at INFO (stderr at DEBUG on failure).
+/// duration at INFO (stderr at DEBUG on failure). stdout and stderr are
+/// captured; stdin is closed, because in DAP mode the inherited stdin is
+/// Zed's request stream.
 async fn output_logged(cmd: &mut Command, what: &str) -> anyhow::Result<std::process::Output> {
     let rendered = logging::describe_command(cmd);
     let started = std::time::Instant::now();
     let out = cmd
+        .stdin(Stdio::null())
         .kill_on_drop(true)
         .output()
         .await

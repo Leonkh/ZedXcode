@@ -2,6 +2,10 @@
 //! Text surgery, never re-serialization — user comments/formatting/trailing
 //! commas survive. See `docs/design/dap-proxy.md` §6.1.
 
+// Also runs in DAP and BSP mode (through the selection and compile stores),
+// whose stdout carries only protocol messages: no `print!` / `println!` here.
+#![deny(clippy::print_stdout)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
